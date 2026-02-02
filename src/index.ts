@@ -7,6 +7,8 @@ type RetestStateRow = {
   disabled_at: string | null;
   last_failure_checks: string | null;
   last_seen_updated_at: string | null;
+  last_check_status: string | null;
+  last_check_at: string | null;
 };
 
 type RetestAttemptRow = {
@@ -97,6 +99,8 @@ type PullItem = {
   state: string;
 };
 
+type PullDetail = PullItem;
+
 async function listRecentOpenPRs(token: string, lookbackHours: number): Promise<PullItem[]> {
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
   const result: PullItem[] = [];
@@ -125,6 +129,13 @@ async function listRecentOpenPRs(token: string, lookbackHours: number): Promise<
   return result;
 }
 
+async function getPullByNumber(token: string, prNumber: number): Promise<PullDetail> {
+  return await githubRequest<PullDetail>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
+    token
+  );
+}
+
 async function getTrackedPrNumbers(env: Env): Promise<number[]> {
   const rows = await env.DB.prepare('SELECT pr_number FROM tracked_prs ORDER BY pr_number ASC')
     .all<{ pr_number: number }>();
@@ -144,6 +155,19 @@ async function getFailedChecks(sha: string, token: string): Promise<string[]> {
   return data.statuses
     .filter((s) => s.state === 'failure' || s.state === 'error')
     .map((s) => s.context);
+}
+
+function classifyChecks(failedChecks: string[], blacklist: Set<string>): { status: string; shouldRetest: boolean } {
+  if (failedChecks.includes(BLOCKED_CHECK)) {
+    return { status: 'ignored', shouldRetest: false };
+  }
+  if (failedChecks.some((name) => blacklist.has(name))) {
+    return { status: 'ignored', shouldRetest: false };
+  }
+  if (failedChecks.length === 0) {
+    return { status: 'success', shouldRetest: false };
+  }
+  return { status: 'failed', shouldRetest: true };
 }
 
 async function postRetestComment(prNumber: number, token: string): Promise<void> {
@@ -169,21 +193,29 @@ async function setSetting(env: Env, key: string, value: string): Promise<void> {
     .run();
 }
 
-async function upsertRetestState(env: Env, pr: PullItem, failedChecks: string[]): Promise<void> {
+async function upsertRetestState(
+  env: Env,
+  pr: PullItem,
+  failedChecks: string[],
+  status: string,
+  checkedAt: string
+): Promise<void> {
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
-    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks)
-     VALUES (?, 0, ?, ?)
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks, last_check_status, last_check_at)
+     VALUES (?, 0, ?, ?, ?, ?)
      ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
-       last_failure_checks = excluded.last_failure_checks`
+       last_failure_checks = excluded.last_failure_checks,
+       last_check_status = excluded.last_check_status,
+       last_check_at = excluded.last_check_at`
   )
-    .bind(pr.number, pr.updated_at, failedJson)
+    .bind(pr.number, pr.updated_at, failedJson, status, checkedAt)
     .run();
 }
 
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
   const row = await env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at
+    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_check_status, last_check_at
      FROM retest_state WHERE pr_number = ?`
   )
     .bind(prNumber)
@@ -264,11 +296,9 @@ async function scanAndSchedule(env: Env): Promise<void> {
   for (const pr of prs) {
     if (!tracked.has(pr.number)) continue;
     const failedChecks = await getFailedChecks(pr.head.sha, token);
-    if (failedChecks.includes(BLOCKED_CHECK)) continue;
-    if (failedChecks.some((name) => blacklist.has(name))) continue;
-    if (failedChecks.length === 0) continue;
-
-    await upsertRetestState(env, pr, failedChecks);
+    const checkResult = classifyChecks(failedChecks, blacklist);
+    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso());
+    if (!checkResult.shouldRetest) continue;
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
     if (state.disabled_at) continue;
@@ -423,9 +453,7 @@ app.post('/webhook/github', async (c) => {
   const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
 
   const failedChecks = await getFailedChecks(payload.pull_request.head.sha, env.GITHUB_TOKEN);
-  if (failedChecks.includes(BLOCKED_CHECK)) return c.json({ ok: true });
-  if (failedChecks.some((name) => blacklist.has(name))) return c.json({ ok: true });
-  if (failedChecks.length === 0) return c.json({ ok: true });
+  const checkResult = classifyChecks(failedChecks, blacklist);
 
   const pr = {
     number: payload.pull_request.number,
@@ -434,9 +462,10 @@ app.post('/webhook/github', async (c) => {
     state: 'closed',
   } as PullItem;
 
-  await upsertRetestState(env, pr, failedChecks);
+  await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso());
   const state = await getRetestState(env, pr.number);
   if (!state) return c.json({ ok: true });
+  if (!checkResult.shouldRetest) return c.json({ ok: true });
 
   if (state.attempt_count >= BACKOFF_MINUTES.length) {
     const newCount = Math.max(0, state.attempt_count - 2);
@@ -461,7 +490,31 @@ app.post('/track/:num', async (c) => {
   const num = Number(c.req.param('num'));
   if (!Number.isFinite(num) || num <= 0) return c.json({ error: 'Invalid PR number' }, 400);
   await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
-  return c.json({ ok: true, pr_number: num });
+
+  try {
+    const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
+    const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
+    const failedChecks = await getFailedChecks(pr.head.sha, c.env.GITHUB_TOKEN);
+    const checkResult = classifyChecks(failedChecks, blacklist);
+
+    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso());
+
+    if (checkResult.shouldRetest) {
+      const state = await getRetestState(c.env, num);
+      if (state && !state.disabled_at) {
+        const pending = await getPendingAttempt(c.env, num);
+        if (!pending) {
+          await scheduleImmediateAttempt(c.env, num, state.attempt_count);
+          await executeDueAttempts(c.env);
+        }
+      }
+    }
+
+    return c.json({ ok: true, pr_number: num, status: checkResult.status });
+  } catch (error) {
+    await c.env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(num).run();
+    return c.json({ error: 'Failed to load PR from GitHub' }, 404);
+  }
 });
 
 app.delete('/track/:num', async (c) => {
@@ -475,19 +528,28 @@ app.delete('/track/:num', async (c) => {
 
 app.get('/prs', async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at
-     FROM retest_state
-     ORDER BY last_seen_updated_at DESC
-     LIMIT 200`
+    `SELECT t.pr_number,
+            COALESCE(s.attempt_count, 0) AS attempt_count,
+            s.next_retest_at,
+            s.disabled_at,
+            s.last_failure_checks,
+            s.last_seen_updated_at,
+            s.last_check_status,
+            s.last_check_at
+     FROM tracked_prs t
+     LEFT JOIN retest_state s ON s.pr_number = t.pr_number
+     ORDER BY t.pr_number ASC`
   )
     .all<RetestStateRow>();
 
   const prs = (rows.results || []).map((row) => ({
     pr_number: row.pr_number,
-    attempt_count: row.attempt_count,
+    attempt_count: row.attempt_count ?? 0,
     next_retest_at: row.next_retest_at,
     disabled_at: row.disabled_at,
     last_seen_updated_at: row.last_seen_updated_at,
+    last_check_status: row.last_check_status ?? 'unknown',
+    last_check_at: row.last_check_at,
     failed_checks: row.last_failure_checks ? JSON.parse(row.last_failure_checks) : [],
   }));
 
@@ -652,6 +714,10 @@ app.get('/', async (c) => {
         .badge-attempt { background: #e0f2fe; color: #0369a1; }
         .badge-next { background: #dcfce7; color: #166534; }
         .badge-disabled { background: #fee2e2; color: #991b1b; }
+        .badge-success { background: #dcfce7; color: #166534; }
+        .badge-failed { background: #fee2e2; color: #b91c1c; }
+        .badge-ignored { background: #e2e8f0; color: #475569; }
+        .badge-unknown { background: #e2e8f0; color: #475569; }
         .failures {
           margin-top: 10px;
           padding-top: 10px;
@@ -703,7 +769,7 @@ app.get('/', async (c) => {
         </div>
 
         <div class="card list-section">
-          <h2>Recent PRs with Failures</h2>
+          <h2>Tracked PRs</h2>
           <ul id="pr-list" class="pr-list">
             <li class="loading">Loading...</li>
           </ul>
@@ -733,7 +799,7 @@ app.get('/', async (c) => {
             }
 
             listEl.innerHTML = '';
-            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, failed_checks }) => {
+            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, failed_checks }) => {
               const li = document.createElement('li');
               li.className = 'pr-item';
 
@@ -756,6 +822,12 @@ app.get('/', async (c) => {
               attemptBadge.textContent = 'attempts ' + attempt_count;
               meta.appendChild(attemptBadge);
 
+              const statusBadge = document.createElement('span');
+              const statusText = (last_check_status || 'unknown').toLowerCase();
+              statusBadge.className = 'badge badge-' + statusText;
+              statusBadge.textContent = statusText;
+              meta.appendChild(statusBadge);
+
               if (next_retest_at) {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
@@ -774,6 +846,12 @@ app.get('/', async (c) => {
                 const lastSeen = document.createElement('span');
                 lastSeen.textContent = 'updated ' + last_seen_updated_at;
                 meta.appendChild(lastSeen);
+              }
+
+              if (last_check_at) {
+                const lastCheck = document.createElement('span');
+                lastCheck.textContent = 'checked ' + last_check_at;
+                meta.appendChild(lastCheck);
               }
 
               left.appendChild(link);
