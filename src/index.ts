@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 
-type CheckStatus = 'ignored' | 'success' | 'failed' | 'running';
+type CheckStatus = 'ignored' | 'success' | 'failed' | 'running' | 'conflict';
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
 type RetestStateRow = {
@@ -102,6 +102,8 @@ type PullItem = {
   updated_at: string;
   head: { sha: string };
   state: string;
+  mergeable: boolean | null;
+  mergeable_state: string | null;
 };
 
 type PullDetail = PullItem;
@@ -165,6 +167,11 @@ function classifyChecks(
     return { status: 'running', shouldRetest: false, log: 'Checks pending' };
   }
   return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
+}
+
+function isMergeConflict(pr: PullItem): boolean {
+  if (!pr.mergeable_state) return false;
+  return pr.mergeable_state === 'dirty';
 }
 
 async function postRetestComment(prNumber: number, token: string): Promise<void> {
@@ -343,9 +350,16 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const updatedMs = Date.parse(pr.updated_at);
     if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
 
-    const summary = await getCheckStateSummary(pr.head.sha, token);
-    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
-    await upsertRetestState(env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
+    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let failedChecks: string[] = [];
+    if (isMergeConflict(pr)) {
+      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+    } else {
+      const summary = await getCheckStateSummary(pr.head.sha, token);
+      failedChecks = summary.failed;
+      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    }
+    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
     if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -491,11 +505,18 @@ app.post('/track/:num', async (c) => {
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
     const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
-    const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
-    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let failedChecks: string[] = [];
+    if (isMergeConflict(pr)) {
+      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+    } else {
+      const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
+      failedChecks = summary.failed;
+      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    }
 
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
-    await upsertRetestState(c.env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
+    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
 
     const state = await getRetestState(c.env, num);
     if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -563,19 +584,42 @@ app.get('/prs', async (c) => {
 });
 
 app.get('/', async (c) => {
-  let lastCronText = 'Never';
-  let nextCronText = 'Unknown';
+  let lastCronIso: string | null = null;
+  let lastCronStatus: string | null = null;
+  let nextCronIso: string | null = null;
+  let nextScanIso: string | null = null;
   const row = await c.env.DB.prepare(
     'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
   ).first<{ started_at: string; status: string }>();
   if (row) {
-    lastCronText = `${row.started_at} (${row.status})`;
+    lastCronIso = row.started_at;
+    lastCronStatus = row.status;
     const lastMs = Date.parse(row.started_at);
     if (Number.isFinite(lastMs)) {
       const nextMs = lastMs + CRON_INTERVAL_MINUTES * 60 * 1000;
-      nextCronText = new Date(nextMs).toISOString();
+      nextCronIso = new Date(nextMs).toISOString();
     }
   }
+
+  const scanIntervalMinutes = parseNumber(c.env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
+  const lastScan = await getSetting(c.env, 'last_scan_at');
+  if (lastScan) {
+    const lastScanMs = Date.parse(lastScan);
+    if (Number.isFinite(lastScanMs)) {
+      const nextScanMs = lastScanMs + scanIntervalMinutes * 60 * 1000;
+      nextScanIso = new Date(nextScanMs).toISOString();
+    }
+  }
+
+  const lastCronSpan = lastCronIso
+    ? `<span id="last-cron" class="ts" data-iso="${lastCronIso}" data-suffix=" (${lastCronStatus ?? 'unknown'})"></span>`
+    : '<span id="last-cron">Never</span>';
+  const nextCronSpan = nextCronIso
+    ? `<span id="next-cron" class="ts" data-iso="${nextCronIso}"></span>`
+    : '<span id="next-cron">Unknown</span>';
+  const nextScanSpan = nextScanIso
+    ? `<span id="next-scan" class="ts" data-iso="${nextScanIso}"></span>`
+    : '<span id="next-scan">Unknown</span>';
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -607,7 +651,16 @@ app.get('/', async (c) => {
         .subtitle {
           color: rgba(226, 232, 240, 0.8);
           font-size: 14px;
-          margin-bottom: 32px;
+          margin-bottom: 24px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          line-height: 1.5;
+        }
+        .subtitle-line {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
         }
         .card {
           background: #ffffff;
@@ -665,6 +718,21 @@ app.get('/', async (c) => {
           font-size: 12px;
         }
         .remove-btn:hover { background: #fee2e2; color: #b91c1c; }
+        .copy-btn {
+          background: transparent;
+          color: #0284c7;
+          padding: 2px 6px;
+          font-size: 12px;
+          line-height: 1;
+        }
+        .copy-btn svg {
+          width: 14px;
+          height: 14px;
+          display: block;
+          stroke: currentColor;
+        }
+        .copy-btn:hover { color: #0ea5e9; }
+        .copy-btn:active { transform: translateY(1px); }
         .list-section h2 {
           font-size: 18px;
           margin: 0 0 16px 0;
@@ -733,6 +801,7 @@ app.get('/', async (c) => {
         .badge-ignored { background: #e2e8f0; color: #475569; }
         .badge-running { background: #fef9c3; color: #92400e; }
         .badge-unknown { background: #e2e8f0; color: #475569; }
+        .badge-conflict { background: #fee2e2; color: #b91c1c; }
         .failures {
           margin-top: 10px;
           padding-top: 10px;
@@ -772,7 +841,11 @@ app.get('/', async (c) => {
     <body>
       <div class="container">
         <h1>Retest as a Service</h1>
-        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronText} • Next cron: ${nextCronText}</div>
+        <div class="subtitle">
+          <div class="subtitle-line">pingcap/tidb</div>
+          <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
+          <div class="subtitle-line">Next scan: ${nextScanSpan}</div>
+        </div>
 
         <div class="card add-section">
           <h2>Track PR</h2>
@@ -795,10 +868,38 @@ app.get('/', async (c) => {
         const msgEl = document.getElementById('message');
         const inputEl = document.getElementById('pr-input');
         const listEl = document.getElementById('pr-list');
+        const timeFormatter = new Intl.DateTimeFormat(undefined, {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+          timeZoneName: 'short',
+        });
 
         function setMessage(text, type = '') {
           msgEl.textContent = text || '';
           msgEl.className = 'msg ' + (type || '');
+        }
+
+        function formatTimestamp(iso) {
+          if (!iso) return '';
+          const date = new Date(iso);
+          if (Number.isNaN(date.getTime())) return iso;
+          return timeFormatter.format(date);
+        }
+
+        function applyLocalTimeLabels(root = document) {
+          const nodes = root.querySelectorAll('[data-iso]');
+          nodes.forEach((node) => {
+            const iso = node.dataset.iso;
+            if (!iso) return;
+            const prefix = node.dataset.prefix || '';
+            const suffix = node.dataset.suffix || '';
+            node.textContent = prefix + formatTimestamp(iso) + suffix;
+          });
         }
 
         async function refreshList() {
@@ -846,7 +947,9 @@ app.get('/', async (c) => {
               if (next_retest_at) {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
-                nextBadge.textContent = 'next ' + next_retest_at;
+                nextBadge.dataset.iso = next_retest_at;
+                nextBadge.dataset.prefix = 'next check ';
+                nextBadge.textContent = 'next check ' + next_retest_at;
                 meta.appendChild(nextBadge);
               }
 
@@ -859,22 +962,26 @@ app.get('/', async (c) => {
 
               if (last_seen_updated_at) {
                 const lastSeen = document.createElement('span');
+                lastSeen.dataset.iso = last_seen_updated_at;
+                lastSeen.dataset.prefix = 'updated · ';
                 lastSeen.textContent = 'updated ' + last_seen_updated_at;
                 meta.appendChild(lastSeen);
               }
 
               if (last_check_at) {
                 const lastCheck = document.createElement('span');
+                lastCheck.dataset.iso = last_check_at;
+                lastCheck.dataset.prefix = 'checked · ';
                 lastCheck.textContent = 'checked ' + last_check_at;
                 meta.appendChild(lastCheck);
               }
 
               left.appendChild(link);
-              left.appendChild(meta);
               header.appendChild(left);
 
               const delBtn = document.createElement('button');
               delBtn.className = 'remove-btn';
+              delBtn.type = 'button';
               delBtn.textContent = 'Remove';
               delBtn.addEventListener('click', async () => {
                 setMessage('Removing PR #' + pr_number + '...');
@@ -887,6 +994,34 @@ app.get('/', async (c) => {
                   setMessage('Failed to remove: ' + (err.error || res.status), 'error');
                 }
               });
+              const copyBtn = document.createElement('button');
+              copyBtn.className = 'copy-btn';
+              copyBtn.type = 'button';
+              copyBtn.setAttribute('aria-label', 'Copy PR ID');
+              copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><rect x="4" y="4" width="11" height="11" rx="2"></rect></svg>';
+              copyBtn.addEventListener('click', async () => {
+                const text = String(pr_number);
+                try {
+                  if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                  } else {
+                    const temp = document.createElement('textarea');
+                    temp.value = text;
+                    temp.setAttribute('readonly', 'true');
+                    temp.style.position = 'absolute';
+                    temp.style.left = '-9999px';
+                    document.body.appendChild(temp);
+                    temp.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(temp);
+                  }
+                  setMessage('Copied PR #' + pr_number, 'success');
+                } catch (e) {
+                  setMessage('Failed to copy PR #' + pr_number, 'error');
+                }
+              });
+              left.appendChild(copyBtn);
+              left.appendChild(meta);
               header.appendChild(delBtn);
               li.appendChild(header);
 
@@ -946,6 +1081,7 @@ app.get('/', async (c) => {
 
               listEl.appendChild(li);
             });
+            applyLocalTimeLabels(listEl);
           } catch (e) {
             listEl.innerHTML = '<li class="empty-state" style="color: #b91c1c;">Failed to load PRs</li>';
           }
@@ -980,6 +1116,8 @@ app.get('/', async (c) => {
         });
 
         refreshList();
+        applyLocalTimeLabels();
+        setInterval(() => applyLocalTimeLabels(), 60 * 1000);
       </script>
     </body>
   </html>`;
