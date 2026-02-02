@@ -635,7 +635,16 @@ app.get('/', async (c) => {
         .subtitle {
           color: rgba(226, 232, 240, 0.8);
           font-size: 14px;
-          margin-bottom: 32px;
+          margin-bottom: 24px;
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+          line-height: 1.5;
+        }
+        .subtitle-line {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 10px;
         }
         .card {
           background: #ffffff;
@@ -694,12 +703,14 @@ app.get('/', async (c) => {
         }
         .remove-btn:hover { background: #fee2e2; color: #b91c1c; }
         .copy-btn {
-          background: #e0f2fe;
-          color: #0369a1;
-          padding: 8px 12px;
+          background: transparent;
+          color: #0284c7;
+          padding: 2px 6px;
           font-size: 12px;
+          line-height: 1;
         }
-        .copy-btn:hover { background: #bae6fd; color: #0c4a6e; }
+        .copy-btn:hover { color: #0ea5e9; }
+        .copy-btn:active { transform: translateY(1px); }
         .list-section h2 {
           font-size: 18px;
           margin: 0 0 16px 0;
@@ -807,7 +818,12 @@ app.get('/', async (c) => {
     <body>
       <div class="container">
         <h1>Retest as a Service</h1>
-        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan} • Last scan: ${lastScanSpan} • Next check: ${nextScanSpan} • Timezone: <span id="tz-label"></span></div>
+        <div class="subtitle">
+          <div class="subtitle-line">pingcap/tidb</div>
+          <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
+          <div class="subtitle-line">Last scan: ${lastScanSpan} • Next check: ${nextScanSpan}</div>
+          <div class="subtitle-line">Timezone: <span id="tz-label"></span></div>
+        </div>
 
         <div class="card add-section">
           <h2>Track PR</h2>
@@ -964,7 +980,8 @@ app.get('/', async (c) => {
               const copyBtn = document.createElement('button');
               copyBtn.className = 'copy-btn';
               copyBtn.type = 'button';
-              copyBtn.textContent = 'Copy ID';
+              copyBtn.setAttribute('aria-label', 'Copy PR ID');
+              copyBtn.textContent = '⧉';
               copyBtn.addEventListener('click', async () => {
                 const text = String(pr_number);
                 try {
