@@ -1,5 +1,8 @@
 import { Hono } from 'hono';
 
+type CheckStatus = 'ignored' | 'success' | 'failed';
+type CheckStatusWithUnknown = CheckStatus | 'unknown';
+
 type RetestStateRow = {
   pr_number: number;
   attempt_count: number;
@@ -7,7 +10,7 @@ type RetestStateRow = {
   disabled_at: string | null;
   last_failure_checks: string | null;
   last_seen_updated_at: string | null;
-  last_check_status: string | null;
+  last_check_status: CheckStatusWithUnknown | null;
   last_check_at: string | null;
   last_error_message: string | null;
   last_status_log: string | null;
@@ -42,7 +45,6 @@ const BACKOFF_MINUTES = [0, 10, 20, 4, 360];
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
-const MASTER_BRANCH = 'master';
 const BLOCKED_CHECK = 'fast_test_tiprow';
 
 function nowIso(): string {
@@ -104,34 +106,6 @@ type PullItem = {
 
 type PullDetail = PullItem;
 
-async function listRecentOpenPRs(token: string, lookbackHours: number): Promise<PullItem[]> {
-  const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  const result: PullItem[] = [];
-
-  for (let page = 1; page <= 10; page += 1) {
-    const pulls = await githubRequest<PullItem[]>(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`,
-      token
-    );
-
-    if (pulls.length === 0) break;
-
-    let shouldStop = false;
-    for (const pr of pulls) {
-      const updatedMs = Date.parse(pr.updated_at);
-      if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) {
-        shouldStop = true;
-        continue;
-      }
-      result.push(pr);
-    }
-
-    if (shouldStop) break;
-  }
-
-  return result;
-}
-
 async function getPullByNumber(token: string, prNumber: number): Promise<PullDetail> {
   return await githubRequest<PullDetail>(
     `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
@@ -163,7 +137,7 @@ async function getFailedChecks(sha: string, token: string): Promise<string[]> {
 function classifyChecks(
   failedChecks: string[],
   blacklist: Set<string>
-): { status: string; shouldRetest: boolean; log: string } {
+): { status: CheckStatus; shouldRetest: boolean; log: string } {
   if (failedChecks.includes(BLOCKED_CHECK)) {
     return { status: 'ignored', shouldRetest: false, log: `Blocked check: ${BLOCKED_CHECK}` };
   }
@@ -203,7 +177,7 @@ async function upsertRetestState(
   env: Env,
   pr: PullItem,
   failedChecks: string[],
-  status: string,
+  status: CheckStatus,
   checkedAt: string,
   statusLog: string
 ): Promise<void> {
@@ -229,6 +203,12 @@ async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRo
     .bind(prNumber)
     .first<RetestStateRow>();
   return row ?? null;
+}
+
+async function deleteTrackedPrData(env: Env, prNumber: number): Promise<void> {
+  await env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(prNumber).run();
+  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ?').bind(prNumber).run();
+  await env.DB.prepare('DELETE FROM retest_state WHERE pr_number = ?').bind(prNumber).run();
 }
 
 async function resetAttemptsIfRecovered(env: Env, prNumber: number): Promise<void> {
@@ -323,9 +303,24 @@ async function scanAndSchedule(env: Env): Promise<void> {
     return;
   }
 
-  const prs = await listRecentOpenPRs(token, lookbackHours);
-  for (const pr of prs) {
-    if (!tracked.has(pr.number)) continue;
+  const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+  for (const prNumber of tracked) {
+    let pr: PullDetail;
+    try {
+      pr = await getPullByNumber(token, prNumber);
+    } catch (error) {
+      console.error(`Failed to fetch PR #${prNumber}:`, error);
+      continue;
+    }
+
+    if (pr.state !== 'open') {
+      await deleteTrackedPrData(env, prNumber);
+      continue;
+    }
+
+    const updatedMs = Date.parse(pr.updated_at);
+    if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
+
     const failedChecks = await getFailedChecks(pr.head.sha, token);
     const checkResult = classifyChecks(failedChecks, blacklist);
     await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
@@ -389,6 +384,7 @@ async function executeDueAttempts(env: Env): Promise<void> {
     await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
       .bind(status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`, attempt.pr_number)
       .run();
+
   }
 }
 
@@ -464,77 +460,13 @@ async function verifyWebhookSignature(secret: string, body: ArrayBuffer, signatu
 }
 
 app.post('/webhook/github', async (c) => {
-  const env = c.env;
-  const signature = c.req.header('X-Hub-Signature-256');
-  const body = await c.req.arrayBuffer();
-
-  if (env.GITHUB_WEBHOOK_SECRET) {
-    const ok = await verifyWebhookSignature(env.GITHUB_WEBHOOK_SECRET, body, signature ?? null);
-    if (!ok) return c.json({ error: 'Invalid signature' }, 401);
-  }
-
-  const event = c.req.header('X-GitHub-Event') || 'unknown';
-  if (event !== 'pull_request') return c.json({ ok: true });
-
-  const payload = JSON.parse(new TextDecoder().decode(body)) as {
-    action: string;
-    pull_request: { number: number; merged: boolean; base: { ref: string }; head: { sha: string } };
-  };
-
-  if (payload.action !== 'closed') return c.json({ ok: true });
-  if (!payload.pull_request.merged) return c.json({ ok: true });
-  if (payload.pull_request.base.ref !== MASTER_BRANCH) return c.json({ ok: true });
-
-  const tracked = new Set(await getTrackedPrNumbers(env));
-  if (!tracked.has(payload.pull_request.number)) return c.json({ ok: true });
-
-  const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
-
-  const failedChecks = await getFailedChecks(payload.pull_request.head.sha, env.GITHUB_TOKEN);
-  const checkResult = classifyChecks(failedChecks, blacklist);
-
-  const pr = {
-    number: payload.pull_request.number,
-    updated_at: nowIso(),
-    head: { sha: payload.pull_request.head.sha },
-    state: 'closed',
-  } as PullItem;
-
-  await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
-  const state = await getRetestState(env, pr.number);
-  if (!state) return c.json({ ok: true });
-  if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
-    await resetAttemptsIfRecovered(env, pr.number);
-    return c.json({ ok: true });
-  }
-  if (!checkResult.shouldRetest) return c.json({ ok: true });
-
-  if (state.attempt_count >= BACKOFF_MINUTES.length) {
-    const newCount = Math.max(0, state.attempt_count - 2);
-    await env.DB.prepare('UPDATE retest_state SET attempt_count = ?, disabled_at = NULL WHERE pr_number = ?')
-      .bind(newCount, pr.number)
-      .run();
-    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-      .bind(`Reached max attempts, reduced to ${newCount}`, pr.number)
-      .run();
-  }
-
-  const pending = await getPendingAttempt(env, pr.number);
-  if (!pending) {
-    const refreshed = await getRetestState(env, pr.number);
-    if (refreshed) {
-      await scheduleImmediateAttempt(env, pr.number, refreshed.attempt_count);
-    }
-  }
-
-  await executeDueAttempts(env);
-  return c.json({ ok: true });
+  return c.json({ ok: true, disabled: true });
 });
+
 
 app.post('/track/:num', async (c) => {
   const num = Number(c.req.param('num'));
   if (!Number.isFinite(num) || num <= 0) return c.json({ error: 'Invalid PR number' }, 400);
-  await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
 
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
@@ -542,6 +474,7 @@ app.post('/track/:num', async (c) => {
     const failedChecks = await getFailedChecks(pr.head.sha, c.env.GITHUB_TOKEN);
     const checkResult = classifyChecks(failedChecks, blacklist);
 
+    await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
     await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
 
     const state = await getRetestState(c.env, num);
@@ -562,7 +495,6 @@ app.post('/track/:num', async (c) => {
 
     return c.json({ ok: true, pr_number: num, status: checkResult.status });
   } catch (error) {
-    await c.env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(num).run();
     return c.json({ error: 'Failed to load PR from GitHub' }, 404);
   }
 });
@@ -570,9 +502,7 @@ app.post('/track/:num', async (c) => {
 app.delete('/track/:num', async (c) => {
   const num = Number(c.req.param('num'));
   if (!Number.isFinite(num) || num <= 0) return c.json({ error: 'Invalid PR number' }, 400);
-  await c.env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(num).run();
-  await c.env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ?').bind(num).run();
-  await c.env.DB.prepare('DELETE FROM retest_state WHERE pr_number = ?').bind(num).run();
+  await deleteTrackedPrData(c.env, num);
   return c.json({ ok: true, pr_number: num });
 });
 
@@ -584,7 +514,7 @@ app.get('/prs', async (c) => {
             s.disabled_at,
             s.last_failure_checks,
             s.last_seen_updated_at,
-            s.last_check_status,
+            COALESCE(s.last_check_status, 'unknown') AS last_check_status,
             s.last_check_at,
             s.last_error_message,
             s.last_status_log
@@ -596,11 +526,11 @@ app.get('/prs', async (c) => {
 
   const prs = (rows.results || []).map((row) => ({
     pr_number: row.pr_number,
-    attempt_count: row.attempt_count ?? 0,
+    attempt_count: row.attempt_count,
     next_retest_at: row.next_retest_at,
     disabled_at: row.disabled_at,
     last_seen_updated_at: row.last_seen_updated_at,
-    last_check_status: row.last_check_status ?? 'unknown',
+    last_check_status: row.last_check_status,
     last_check_at: row.last_check_at,
     last_error_message: row.last_error_message,
     last_status_log: row.last_status_log,

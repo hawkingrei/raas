@@ -32,10 +32,7 @@ Requirements:
    - Timezone: Asia/Shanghai. Day max = 2, Night max = 5.
 
 5. Webhook:
-   - Only handle merge to master.
-   - On merge to master, immediately check if the PR is failing.
-   - If attempt_count has reached the limit (attempt_count = 5), reduce by 2 (e.g. 5 -> 3) to allow retest again.
-   - For non-limited PRs, start immediately but still honor max concurrency.
+   - Webhook handling is paused/disabled for now.
 
 6. UI:
    - UI should mimic ./raas style.

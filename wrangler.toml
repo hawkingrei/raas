@@ -22,6 +22,7 @@ SCAN_INTERVAL_MINUTES = "10"
 DAY_MAX_RETESTS = "2"
 NIGHT_MAX_RETESTS = "5"
 
+
 # Secrets to be configured via `wrangler secret put`:
 # - GITHUB_TOKEN: GitHub personal access token
 # - GITHUB_WEBHOOK_SECRET: optional HMAC secret for GitHub webhook
