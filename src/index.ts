@@ -567,7 +567,6 @@ app.get('/', async (c) => {
   let lastCronStatus: string | null = null;
   let nextCronIso: string | null = null;
   let nextScanIso: string | null = null;
-  let lastScanIso: string | null = null;
   const row = await c.env.DB.prepare(
     'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
   ).first<{ started_at: string; status: string }>();
@@ -584,7 +583,6 @@ app.get('/', async (c) => {
   const scanIntervalMinutes = parseNumber(c.env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
   const lastScan = await getSetting(c.env, 'last_scan_at');
   if (lastScan) {
-    lastScanIso = lastScan;
     const lastScanMs = Date.parse(lastScan);
     if (Number.isFinite(lastScanMs)) {
       const nextScanMs = lastScanMs + scanIntervalMinutes * 60 * 1000;
@@ -601,9 +599,6 @@ app.get('/', async (c) => {
   const nextScanSpan = nextScanIso
     ? `<span id="next-scan" class="ts" data-iso="${nextScanIso}"></span>`
     : '<span id="next-scan">Unknown</span>';
-  const lastScanSpan = lastScanIso
-    ? `<span id="last-scan" class="ts" data-iso="${lastScanIso}"></span>`
-    : '<span id="last-scan">Unknown</span>';
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -827,8 +822,7 @@ app.get('/', async (c) => {
         <div class="subtitle">
           <div class="subtitle-line">pingcap/tidb</div>
           <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
-          <div class="subtitle-line">Last scan: ${lastScanSpan} • Next check: ${nextScanSpan}</div>
-          <div class="subtitle-line">Timezone: <span id="tz-label"></span></div>
+          <div class="subtitle-line">Next scan: ${nextScanSpan} • Timezone: <span id="tz-label"></span></div>
         </div>
 
         <div class="card add-section">
@@ -936,8 +930,8 @@ app.get('/', async (c) => {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
                 nextBadge.dataset.iso = next_retest_at;
-                nextBadge.dataset.prefix = 'next ';
-                nextBadge.textContent = 'next ' + next_retest_at;
+                nextBadge.dataset.prefix = 'next check ';
+                nextBadge.textContent = 'next check ' + next_retest_at;
                 meta.appendChild(nextBadge);
               }
 
@@ -965,7 +959,6 @@ app.get('/', async (c) => {
               }
 
               left.appendChild(link);
-              left.appendChild(meta);
               header.appendChild(left);
 
               const delBtn = document.createElement('button');
@@ -1010,6 +1003,7 @@ app.get('/', async (c) => {
                 }
               });
               left.appendChild(copyBtn);
+              left.appendChild(meta);
               header.appendChild(delBtn);
               li.appendChild(header);
 
