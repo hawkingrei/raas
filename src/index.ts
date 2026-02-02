@@ -231,6 +231,17 @@ async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRo
   return row ?? null;
 }
 
+async function resetAttemptsIfRecovered(env: Env, prNumber: number): Promise<void> {
+  await env.DB.prepare(
+    'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
+  )
+    .bind('CI recovered, reset attempts', prNumber)
+    .run();
+  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
+    .bind(prNumber)
+    .run();
+}
+
 async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAttemptRow | null> {
   const row = await env.DB.prepare(
     `SELECT id, pr_number, attempt_index, scheduled_at
@@ -318,9 +329,13 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const failedChecks = await getFailedChecks(pr.head.sha, token);
     const checkResult = classifyChecks(failedChecks, blacklist);
     await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
-    if (!checkResult.shouldRetest) continue;
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
+    if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
+      await resetAttemptsIfRecovered(env, pr.number);
+      continue;
+    }
+    if (!checkResult.shouldRetest) continue;
     if (state.disabled_at) continue;
 
     const pending = await getPendingAttempt(env, pr.number);
@@ -488,6 +503,10 @@ app.post('/webhook/github', async (c) => {
   await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
   const state = await getRetestState(env, pr.number);
   if (!state) return c.json({ ok: true });
+  if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
+    await resetAttemptsIfRecovered(env, pr.number);
+    return c.json({ ok: true });
+  }
   if (!checkResult.shouldRetest) return c.json({ ok: true });
 
   if (state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -525,8 +544,13 @@ app.post('/track/:num', async (c) => {
 
     await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
 
+    const state = await getRetestState(c.env, num);
+    if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
+      await resetAttemptsIfRecovered(c.env, num);
+      return c.json({ ok: true, pr_number: num, status: checkResult.status });
+    }
+
     if (checkResult.shouldRetest) {
-      const state = await getRetestState(c.env, num);
       if (state && !state.disabled_at) {
         const pending = await getPendingAttempt(c.env, num);
         if (!pending) {
