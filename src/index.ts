@@ -206,9 +206,11 @@ async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRo
 }
 
 async function deleteTrackedPrData(env: Env, prNumber: number): Promise<void> {
-  await env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(prNumber).run();
-  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ?').bind(prNumber).run();
-  await env.DB.prepare('DELETE FROM retest_state WHERE pr_number = ?').bind(prNumber).run();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(prNumber),
+    env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ?').bind(prNumber),
+    env.DB.prepare('DELETE FROM retest_state WHERE pr_number = ?').bind(prNumber),
+  ]);
 }
 
 async function resetAttemptsIfRecovered(env: Env, prNumber: number): Promise<void> {
@@ -237,11 +239,10 @@ async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAtte
 
 async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
   if (attemptCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
-      .bind(nowIso(), prNumber)
-      .run();
-    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-      .bind('Reached max attempts', prNumber)
+    await env.DB.prepare(
+      'UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL, last_status_log = ? WHERE pr_number = ?'
+    )
+      .bind(nowIso(), 'Reached max attempts', prNumber)
       .run();
     return;
   }
@@ -266,11 +267,10 @@ async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: num
 
 async function scheduleImmediateAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
   if (attemptCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
-      .bind(nowIso(), prNumber)
-      .run();
-    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-      .bind('Reached max attempts', prNumber)
+    await env.DB.prepare(
+      'UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL, last_status_log = ? WHERE pr_number = ?'
+    )
+      .bind(nowIso(), 'Reached max attempts', prNumber)
       .run();
     return;
   }
