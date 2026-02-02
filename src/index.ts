@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 
-type CheckStatus = 'ignored' | 'success' | 'failed' | 'running';
+type CheckStatus = 'ignored' | 'success' | 'failed' | 'running' | 'conflict';
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
 type RetestStateRow = {
@@ -102,6 +102,8 @@ type PullItem = {
   updated_at: string;
   head: { sha: string };
   state: string;
+  mergeable: boolean | null;
+  mergeable_state: string | null;
 };
 
 type PullDetail = PullItem;
@@ -165,6 +167,11 @@ function classifyChecks(
     return { status: 'running', shouldRetest: false, log: 'Checks pending' };
   }
   return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
+}
+
+function isMergeConflict(pr: PullItem): boolean {
+  if (!pr.mergeable_state) return false;
+  return pr.mergeable_state === 'dirty';
 }
 
 async function postRetestComment(prNumber: number, token: string): Promise<void> {
@@ -343,9 +350,16 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const updatedMs = Date.parse(pr.updated_at);
     if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
 
-    const summary = await getCheckStateSummary(pr.head.sha, token);
-    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
-    await upsertRetestState(env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
+    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let failedChecks: string[] = [];
+    if (isMergeConflict(pr)) {
+      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+    } else {
+      const summary = await getCheckStateSummary(pr.head.sha, token);
+      failedChecks = summary.failed;
+      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    }
+    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
     if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -491,11 +505,18 @@ app.post('/track/:num', async (c) => {
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
     const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
-    const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
-    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let failedChecks: string[] = [];
+    if (isMergeConflict(pr)) {
+      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+    } else {
+      const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
+      failedChecks = summary.failed;
+      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    }
 
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
-    await upsertRetestState(c.env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
+    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
 
     const state = await getRetestState(c.env, num);
     if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -780,6 +801,7 @@ app.get('/', async (c) => {
         .badge-ignored { background: #e2e8f0; color: #475569; }
         .badge-running { background: #fef9c3; color: #92400e; }
         .badge-unknown { background: #e2e8f0; color: #475569; }
+        .badge-conflict { background: #fee2e2; color: #b91c1c; }
         .failures {
           margin-top: 10px;
           padding-top: 10px;
