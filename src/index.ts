@@ -941,7 +941,7 @@ app.get('/', async (c) => {
               if (last_seen_updated_at) {
                 const lastSeen = document.createElement('span');
                 lastSeen.dataset.iso = last_seen_updated_at;
-                lastSeen.dataset.prefix = 'updated ';
+                lastSeen.dataset.prefix = 'updated · ';
                 lastSeen.textContent = 'updated ' + last_seen_updated_at;
                 meta.appendChild(lastSeen);
               }
@@ -949,7 +949,7 @@ app.get('/', async (c) => {
               if (last_check_at) {
                 const lastCheck = document.createElement('span');
                 lastCheck.dataset.iso = last_check_at;
-                lastCheck.dataset.prefix = 'checked ';
+                lastCheck.dataset.prefix = 'checked · ';
                 lastCheck.textContent = 'checked ' + last_check_at;
                 meta.appendChild(lastCheck);
               }
