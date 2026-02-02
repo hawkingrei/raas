@@ -1,0 +1,27 @@
+name = "retest-as-a-service"
+main = "src/index.ts"
+compatibility_date = "2024-12-18"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "raas"
+database_id = ""
+
+[vars]
+# Comma-separated failed check names that should be ignored
+CHECK_BLACKLIST = "license/cla,pull-error-log-review,tide,check-issue-triage-complete"
+
+# Scan settings
+SCAN_LOOKBACK_HOURS = "48"
+SCAN_INTERVAL_MINUTES = "10"
+
+# Concurrency per scan window (Asia/Shanghai)
+DAY_MAX_RETESTS = "2"
+NIGHT_MAX_RETESTS = "5"
+
+# Secrets to be configured via `wrangler secret put`:
+# - GITHUB_TOKEN: GitHub personal access token
+# - GITHUB_WEBHOOK_SECRET: optional HMAC secret for GitHub webhook

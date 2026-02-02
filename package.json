@@ -1,0 +1,23 @@
+{
+  "name": "retest-as-a-service",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker to automatically retest failed PRs in pingcap/tidb",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.26.1",
+  "dependencies": {
+    "hono": "^4.11.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251219.0",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.61.1"
+  }
+}

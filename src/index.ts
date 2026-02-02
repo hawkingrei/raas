@@ -1,0 +1,867 @@
+import { Hono } from 'hono';
+
+type RetestStateRow = {
+  pr_number: number;
+  attempt_count: number;
+  next_retest_at: string | null;
+  disabled_at: string | null;
+  last_failure_checks: string | null;
+  last_seen_updated_at: string | null;
+};
+
+type RetestAttemptRow = {
+  id: number;
+  pr_number: number;
+  attempt_index: number;
+  scheduled_at: string;
+};
+
+export interface Env {
+  DB: D1Database;
+  GITHUB_TOKEN: string;
+  CHECK_BLACKLIST: string;
+  SCAN_LOOKBACK_HOURS?: string;
+  SCAN_INTERVAL_MINUTES?: string;
+  DAY_MAX_RETESTS?: string;
+  NIGHT_MAX_RETESTS?: string;
+  TIMEZONE?: string;
+  GITHUB_WEBHOOK_SECRET?: string;
+}
+
+const app = new Hono<{ Bindings: Env }>();
+
+const DEFAULT_LOOKBACK_HOURS = 48;
+const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
+const DEFAULT_DAY_MAX_RETESTS = 2;
+const DEFAULT_NIGHT_MAX_RETESTS = 5;
+const BACKOFF_MINUTES = [0, 10, 20, 4, 360];
+const REPO_OWNER = 'pingcap';
+const REPO_NAME = 'tidb';
+const MASTER_BRANCH = 'master';
+const BLOCKED_CHECK = 'fast_test_tiprow';
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function parseCsv(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+function parseNumber(value: string | undefined, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function isNightInShanghai(now: Date): boolean {
+  const utcHour = now.getUTCHours();
+  const shanghaiHour = (utcHour + 8) % 24;
+  return shanghaiHour >= 18 || shanghaiHour < 9;
+}
+
+function getMaxRetests(now: Date, env: Env): number {
+  const dayMax = parseNumber(env.DAY_MAX_RETESTS, DEFAULT_DAY_MAX_RETESTS);
+  const nightMax = parseNumber(env.NIGHT_MAX_RETESTS, DEFAULT_NIGHT_MAX_RETESTS);
+  return isNightInShanghai(now) ? nightMax : dayMax;
+}
+
+async function githubRequest<T>(path: string, token: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...init,
+    headers: {
+      'Authorization': `token ${token}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'retest-as-a-service',
+      ...(init && init.headers ? init.headers : {}),
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`GitHub request failed: ${response.status} ${response.statusText} ${text}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+type PullItem = {
+  number: number;
+  updated_at: string;
+  head: { sha: string };
+  state: string;
+};
+
+async function listRecentOpenPRs(token: string, lookbackHours: number): Promise<PullItem[]> {
+  const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+  const result: PullItem[] = [];
+
+  for (let page = 1; page <= 10; page += 1) {
+    const pulls = await githubRequest<PullItem[]>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`,
+      token
+    );
+
+    if (pulls.length === 0) break;
+
+    let shouldStop = false;
+    for (const pr of pulls) {
+      const updatedMs = Date.parse(pr.updated_at);
+      if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) {
+        shouldStop = true;
+        continue;
+      }
+      result.push(pr);
+    }
+
+    if (shouldStop) break;
+  }
+
+  return result;
+}
+
+async function getTrackedPrNumbers(env: Env): Promise<number[]> {
+  const rows = await env.DB.prepare('SELECT pr_number FROM tracked_prs ORDER BY pr_number ASC')
+    .all<{ pr_number: number }>();
+  return (rows.results || []).map((row) => row.pr_number);
+}
+
+type CommitStatusResponse = {
+  statuses: Array<{ context: string; state: string }>;
+};
+
+async function getFailedChecks(sha: string, token: string): Promise<string[]> {
+  const data = await githubRequest<CommitStatusResponse>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
+    token
+  );
+
+  return data.statuses
+    .filter((s) => s.state === 'failure' || s.state === 'error')
+    .map((s) => s.context);
+}
+
+async function postRetestComment(prNumber: number, token: string): Promise<void> {
+  await githubRequest(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments`,
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: '/retest' }),
+    }
+  );
+}
+
+async function getSetting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+async function setSetting(env: Env, key: string, value: string): Promise<void> {
+  await env.DB.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .bind(key, value)
+    .run();
+}
+
+async function upsertRetestState(env: Env, pr: PullItem, failedChecks: string[]): Promise<void> {
+  const failedJson = JSON.stringify(failedChecks);
+  await env.DB.prepare(
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks)
+     VALUES (?, 0, ?, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
+       last_failure_checks = excluded.last_failure_checks`
+  )
+    .bind(pr.number, pr.updated_at, failedJson)
+    .run();
+}
+
+async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at
+     FROM retest_state WHERE pr_number = ?`
+  )
+    .bind(prNumber)
+    .first<RetestStateRow>();
+  return row ?? null;
+}
+
+async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAttemptRow | null> {
+  const row = await env.DB.prepare(
+    `SELECT id, pr_number, attempt_index, scheduled_at
+     FROM retest_attempts
+     WHERE pr_number = ? AND executed_at IS NULL
+     ORDER BY scheduled_at ASC
+     LIMIT 1`
+  )
+    .bind(prNumber)
+    .first<RetestAttemptRow>();
+  return row ?? null;
+}
+
+async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
+  if (attemptCount >= BACKOFF_MINUTES.length) {
+    await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
+      .bind(nowIso(), prNumber)
+      .run();
+    return;
+  }
+
+  const delayMinutes = BACKOFF_MINUTES[attemptCount];
+  const scheduledAt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString();
+  const attemptIndex = attemptCount + 1;
+
+  await env.DB.prepare(
+    'INSERT INTO retest_attempts (pr_number, attempt_index, scheduled_at, status) VALUES (?, ?, ?, ?)'
+  )
+    .bind(prNumber, attemptIndex, scheduledAt, 'scheduled')
+    .run();
+
+  await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
+    .bind(scheduledAt, prNumber)
+    .run();
+}
+
+async function scheduleImmediateAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
+  if (attemptCount >= BACKOFF_MINUTES.length) {
+    await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
+      .bind(nowIso(), prNumber)
+      .run();
+    return;
+  }
+
+  const scheduledAt = nowIso();
+  const attemptIndex = attemptCount + 1;
+
+  await env.DB.prepare(
+    'INSERT INTO retest_attempts (pr_number, attempt_index, scheduled_at, status) VALUES (?, ?, ?, ?)'
+  )
+    .bind(prNumber, attemptIndex, scheduledAt, 'scheduled')
+    .run();
+
+  await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
+    .bind(scheduledAt, prNumber)
+    .run();
+}
+
+async function scanAndSchedule(env: Env): Promise<void> {
+  const token = env.GITHUB_TOKEN;
+  const lookbackHours = parseNumber(env.SCAN_LOOKBACK_HOURS, DEFAULT_LOOKBACK_HOURS);
+  const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
+
+  const tracked = new Set(await getTrackedPrNumbers(env));
+  if (tracked.size === 0) {
+    console.log('No tracked PRs, skipping scan.');
+    return;
+  }
+
+  const prs = await listRecentOpenPRs(token, lookbackHours);
+  for (const pr of prs) {
+    if (!tracked.has(pr.number)) continue;
+    const failedChecks = await getFailedChecks(pr.head.sha, token);
+    if (failedChecks.includes(BLOCKED_CHECK)) continue;
+    if (failedChecks.some((name) => blacklist.has(name))) continue;
+    if (failedChecks.length === 0) continue;
+
+    await upsertRetestState(env, pr, failedChecks);
+    const state = await getRetestState(env, pr.number);
+    if (!state) continue;
+    if (state.disabled_at) continue;
+
+    const pending = await getPendingAttempt(env, pr.number);
+    if (pending) continue;
+
+    await scheduleNextAttempt(env, pr.number, state.attempt_count);
+  }
+}
+
+async function executeDueAttempts(env: Env): Promise<void> {
+  const maxRetests = getMaxRetests(new Date(), env);
+  const now = nowIso();
+
+  const rows = await env.DB.prepare(
+    `SELECT id, pr_number, attempt_index, scheduled_at
+     FROM retest_attempts
+     WHERE executed_at IS NULL AND scheduled_at <= ?
+     ORDER BY scheduled_at ASC
+     LIMIT ?`
+  )
+    .bind(now, maxRetests)
+    .all<RetestAttemptRow>();
+
+  const attempts = rows.results || [];
+  for (const attempt of attempts) {
+    let status = 'success';
+    let errorMessage: string | null = null;
+    try {
+      await postRetestComment(attempt.pr_number, env.GITHUB_TOKEN);
+    } catch (error) {
+      status = 'error';
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+
+    await env.DB.prepare(
+      'UPDATE retest_attempts SET executed_at = ?, status = ?, error_message = ? WHERE id = ?'
+    )
+      .bind(now, status, errorMessage, attempt.id)
+      .run();
+
+    const state = await getRetestState(env, attempt.pr_number);
+    if (!state) continue;
+
+    const nextAttemptCount = state.attempt_count + 1;
+    const disable = nextAttemptCount >= BACKOFF_MINUTES.length;
+    await env.DB.prepare(
+      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ? WHERE pr_number = ?'
+    )
+      .bind(nextAttemptCount, now, disable ? now : null, attempt.pr_number)
+      .run();
+  }
+}
+
+async function shouldScan(env: Env): Promise<boolean> {
+  const intervalMinutes = parseNumber(env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
+  const lastScan = await getSetting(env, 'last_scan_at');
+  if (!lastScan) return true;
+
+  const lastMs = Date.parse(lastScan);
+  if (!Number.isFinite(lastMs)) return true;
+  return Date.now() - lastMs >= intervalMinutes * 60 * 1000;
+}
+
+async function handleCron(env: Env): Promise<void> {
+  if (await shouldScan(env)) {
+    await scanAndSchedule(env);
+    await setSetting(env, 'last_scan_at', nowIso());
+  }
+
+  await executeDueAttempts(env);
+}
+
+async function recordCronRun(env: Env, runId: string, patch: { status: string; errorMessage?: string | null }): Promise<void> {
+  await env.DB.prepare(
+    'UPDATE cron_runs SET finished_at = ?, status = ?, error_message = ? WHERE run_id = ?'
+  )
+    .bind(nowIso(), patch.status, patch.errorMessage ?? null, runId)
+    .run();
+}
+
+async function runCronWithMeta(event: ScheduledEvent, env: Env): Promise<void> {
+  const runId = crypto.randomUUID();
+  await env.DB.prepare(
+    'INSERT INTO cron_runs (run_id, scheduled_time_ms, cron, status) VALUES (?, ?, ?, ?)'
+  )
+    .bind(runId, (event as unknown as { scheduledTime?: number }).scheduledTime ?? null, (event as unknown as { cron?: string }).cron ?? null, 'started')
+    .run();
+
+  try {
+    await handleCron(env);
+    await recordCronRun(env, runId, { status: 'success', errorMessage: null });
+  } catch (error) {
+    const message = error instanceof Error ? (error.stack || error.message) : String(error);
+    await recordCronRun(env, runId, { status: 'error', errorMessage: message });
+  }
+}
+
+function timingSafeEqual(a: ArrayBuffer, b: ArrayBuffer): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  const aBytes = new Uint8Array(a);
+  const bBytes = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < aBytes.length; i += 1) {
+    diff |= aBytes[i] ^ bBytes[i];
+  }
+  return diff === 0;
+}
+
+async function verifyWebhookSignature(secret: string, body: ArrayBuffer, signature: string | null): Promise<boolean> {
+  if (!signature || !signature.startsWith('sha256=')) return false;
+  const sigHex = signature.slice('sha256='.length);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const digest = await crypto.subtle.sign('HMAC', key, body);
+  const expected = new Uint8Array(digest);
+  const provided = new Uint8Array(sigHex.match(/.{1,2}/g)?.map((b) => parseInt(b, 16)) || []);
+  return timingSafeEqual(expected.buffer, provided.buffer);
+}
+
+app.post('/webhook/github', async (c) => {
+  const env = c.env;
+  const signature = c.req.header('X-Hub-Signature-256');
+  const body = await c.req.arrayBuffer();
+
+  if (env.GITHUB_WEBHOOK_SECRET) {
+    const ok = await verifyWebhookSignature(env.GITHUB_WEBHOOK_SECRET, body, signature ?? null);
+    if (!ok) return c.json({ error: 'Invalid signature' }, 401);
+  }
+
+  const event = c.req.header('X-GitHub-Event') || 'unknown';
+  if (event !== 'pull_request') return c.json({ ok: true });
+
+  const payload = JSON.parse(new TextDecoder().decode(body)) as {
+    action: string;
+    pull_request: { number: number; merged: boolean; base: { ref: string }; head: { sha: string } };
+  };
+
+  if (payload.action !== 'closed') return c.json({ ok: true });
+  if (!payload.pull_request.merged) return c.json({ ok: true });
+  if (payload.pull_request.base.ref !== MASTER_BRANCH) return c.json({ ok: true });
+
+  const tracked = new Set(await getTrackedPrNumbers(env));
+  if (!tracked.has(payload.pull_request.number)) return c.json({ ok: true });
+
+  const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
+
+  const failedChecks = await getFailedChecks(payload.pull_request.head.sha, env.GITHUB_TOKEN);
+  if (failedChecks.includes(BLOCKED_CHECK)) return c.json({ ok: true });
+  if (failedChecks.some((name) => blacklist.has(name))) return c.json({ ok: true });
+  if (failedChecks.length === 0) return c.json({ ok: true });
+
+  const pr = {
+    number: payload.pull_request.number,
+    updated_at: nowIso(),
+    head: { sha: payload.pull_request.head.sha },
+    state: 'closed',
+  } as PullItem;
+
+  await upsertRetestState(env, pr, failedChecks);
+  const state = await getRetestState(env, pr.number);
+  if (!state) return c.json({ ok: true });
+
+  if (state.attempt_count >= BACKOFF_MINUTES.length) {
+    const newCount = Math.max(0, state.attempt_count - 2);
+    await env.DB.prepare('UPDATE retest_state SET attempt_count = ?, disabled_at = NULL WHERE pr_number = ?')
+      .bind(newCount, pr.number)
+      .run();
+  }
+
+  const pending = await getPendingAttempt(env, pr.number);
+  if (!pending) {
+    const refreshed = await getRetestState(env, pr.number);
+    if (refreshed) {
+      await scheduleImmediateAttempt(env, pr.number, refreshed.attempt_count);
+    }
+  }
+
+  await executeDueAttempts(env);
+  return c.json({ ok: true });
+});
+
+app.post('/track/:num', async (c) => {
+  const num = Number(c.req.param('num'));
+  if (!Number.isFinite(num) || num <= 0) return c.json({ error: 'Invalid PR number' }, 400);
+  await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
+  return c.json({ ok: true, pr_number: num });
+});
+
+app.delete('/track/:num', async (c) => {
+  const num = Number(c.req.param('num'));
+  if (!Number.isFinite(num) || num <= 0) return c.json({ error: 'Invalid PR number' }, 400);
+  await c.env.DB.prepare('DELETE FROM tracked_prs WHERE pr_number = ?').bind(num).run();
+  await c.env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ?').bind(num).run();
+  await c.env.DB.prepare('DELETE FROM retest_state WHERE pr_number = ?').bind(num).run();
+  return c.json({ ok: true, pr_number: num });
+});
+
+app.get('/prs', async (c) => {
+  const rows = await c.env.DB.prepare(
+    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at
+     FROM retest_state
+     ORDER BY last_seen_updated_at DESC
+     LIMIT 200`
+  )
+    .all<RetestStateRow>();
+
+  const prs = (rows.results || []).map((row) => ({
+    pr_number: row.pr_number,
+    attempt_count: row.attempt_count,
+    next_retest_at: row.next_retest_at,
+    disabled_at: row.disabled_at,
+    last_seen_updated_at: row.last_seen_updated_at,
+    failed_checks: row.last_failure_checks ? JSON.parse(row.last_failure_checks) : [],
+  }));
+
+  return c.json({ prs });
+});
+
+app.get('/', async (c) => {
+  let lastCronText = 'Never';
+  const row = await c.env.DB.prepare(
+    'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
+  ).first<{ started_at: string; status: string }>();
+  if (row) lastCronText = `${row.started_at} (${row.status})`;
+
+  const html = `<!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Retest as a Service</title>
+      <style>
+        * { box-sizing: border-box; }
+        body {
+          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+          margin: 0;
+          padding: 0;
+          background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #111827 100%);
+          min-height: 100vh;
+          color: #0f172a;
+        }
+        .container {
+          max-width: 980px;
+          margin: 0 auto;
+          padding: 40px 20px 80px;
+        }
+        h1 {
+          font-size: 36px;
+          color: #e2e8f0;
+          margin: 0 0 8px 0;
+          font-weight: 700;
+        }
+        .subtitle {
+          color: rgba(226, 232, 240, 0.8);
+          font-size: 14px;
+          margin-bottom: 32px;
+        }
+        .card {
+          background: #ffffff;
+          border-radius: 12px;
+          padding: 22px;
+          box-shadow: 0 14px 40px rgba(15, 23, 42, 0.15);
+          margin-bottom: 20px;
+        }
+        .add-section h2 {
+          font-size: 18px;
+          margin: 0 0 16px 0;
+          color: #0f172a;
+        }
+        .row {
+          display: flex;
+          gap: 12px;
+          align-items: stretch;
+        }
+        input[type="number"] {
+          flex: 1;
+          padding: 12px 16px;
+          font-size: 15px;
+          border: 2px solid #e2e8f0;
+          border-radius: 8px;
+          outline: none;
+          transition: border-color 0.2s;
+        }
+        input[type="number"]:focus { border-color: #38bdf8; }
+        button {
+          padding: 12px 20px;
+          font-size: 14px;
+          font-weight: 600;
+          cursor: pointer;
+          border: none;
+          border-radius: 8px;
+          transition: all 0.2s;
+        }
+        #add-btn {
+          background: #0ea5e9;
+          color: white;
+        }
+        #add-btn:hover { background: #0284c7; }
+        .msg {
+          margin-top: 12px;
+          min-height: 20px;
+          font-size: 13px;
+          color: #64748b;
+        }
+        .error { color: #b91c1c; }
+        .success { color: #166534; }
+        .remove-btn {
+          background: #f1f5f9;
+          color: #475569;
+          padding: 8px 14px;
+          font-size: 12px;
+        }
+        .remove-btn:hover { background: #fee2e2; color: #b91c1c; }
+        .list-section h2 {
+          font-size: 18px;
+          margin: 0 0 16px 0;
+          color: #0f172a;
+        }
+        .pr-list {
+          list-style: none;
+          padding: 0;
+          margin: 0;
+        }
+        .pr-item {
+          border: 2px solid #e2e8f0;
+          border-radius: 10px;
+          padding: 16px;
+          margin-bottom: 12px;
+          transition: all 0.2s;
+        }
+        .pr-item:hover {
+          border-color: #38bdf8;
+          box-shadow: 0 4px 14px rgba(56, 189, 248, 0.18);
+        }
+        .pr-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          margin-bottom: 8px;
+        }
+        .pr-left {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+        .pr-link {
+          font-size: 16px;
+          font-weight: 600;
+          color: #0284c7;
+          text-decoration: none;
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+        }
+        .pr-link:hover { text-decoration: underline; }
+        .meta {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+          font-size: 12px;
+          color: #475569;
+        }
+        .badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 6px;
+          padding: 4px 10px;
+          border-radius: 999px;
+          font-size: 11px;
+          font-weight: 700;
+          text-transform: uppercase;
+        }
+        .badge-attempt { background: #e0f2fe; color: #0369a1; }
+        .badge-next { background: #dcfce7; color: #166534; }
+        .badge-disabled { background: #fee2e2; color: #991b1b; }
+        .failures {
+          margin-top: 10px;
+          padding-top: 10px;
+          border-top: 1px solid #e2e8f0;
+        }
+        .failures-title {
+          font-size: 12px;
+          font-weight: 700;
+          color: #b91c1c;
+          margin-bottom: 8px;
+        }
+        .failures-list {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .failure-badge {
+          background: #fee2e2;
+          color: #991b1b;
+          padding: 4px 10px;
+          border-radius: 6px;
+          font-size: 12px;
+          font-family: 'Consolas', 'Monaco', monospace;
+        }
+        .empty-state {
+          text-align: center;
+          padding: 32px 12px;
+          color: #94a3b8;
+        }
+        .loading {
+          text-align: center;
+          padding: 20px;
+          color: #94a3b8;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>Retest as a Service</h1>
+        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronText}</div>
+
+        <div class="card add-section">
+          <h2>Track PR</h2>
+          <div class="row">
+            <input id="pr-input" type="number" placeholder="Enter PR number" min="1" />
+            <button id="add-btn">Track PR</button>
+          </div>
+          <div id="message" class="msg"></div>
+        </div>
+
+        <div class="card list-section">
+          <h2>Recent PRs with Failures</h2>
+          <ul id="pr-list" class="pr-list">
+            <li class="loading">Loading...</li>
+          </ul>
+        </div>
+      </div>
+
+      <script>
+        const msgEl = document.getElementById('message');
+        const inputEl = document.getElementById('pr-input');
+        const listEl = document.getElementById('pr-list');
+
+        function setMessage(text, type = '') {
+          msgEl.textContent = text || '';
+          msgEl.className = 'msg ' + (type || '');
+        }
+
+        async function refreshList() {
+          listEl.innerHTML = '<li class="loading">Loading...</li>';
+          try {
+            const res = await fetch('/prs');
+            const data = await res.json();
+            const prs = (data && data.prs) || [];
+
+            if (prs.length === 0) {
+              listEl.innerHTML = '<li class="empty-state">No recent failures tracked.</li>';
+              return;
+            }
+
+            listEl.innerHTML = '';
+            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, failed_checks }) => {
+              const li = document.createElement('li');
+              li.className = 'pr-item';
+
+              const header = document.createElement('div');
+              header.className = 'pr-header';
+
+              const left = document.createElement('div');
+              left.className = 'pr-left';
+
+              const link = document.createElement('a');
+              link.href = 'https://github.com/pingcap/tidb/pull/' + pr_number;
+              link.target = '_blank';
+              link.className = 'pr-link';
+              link.innerHTML = '#' + pr_number + ' <span style="font-size: 12px;">↗</span>';
+
+              const meta = document.createElement('div');
+              meta.className = 'meta';
+              const attemptBadge = document.createElement('span');
+              attemptBadge.className = 'badge badge-attempt';
+              attemptBadge.textContent = 'attempts ' + attempt_count;
+              meta.appendChild(attemptBadge);
+
+              if (next_retest_at) {
+                const nextBadge = document.createElement('span');
+                nextBadge.className = 'badge badge-next';
+                nextBadge.textContent = 'next ' + next_retest_at;
+                meta.appendChild(nextBadge);
+              }
+
+              if (disabled_at) {
+                const disabledBadge = document.createElement('span');
+                disabledBadge.className = 'badge badge-disabled';
+                disabledBadge.textContent = 'disabled';
+                meta.appendChild(disabledBadge);
+              }
+
+              if (last_seen_updated_at) {
+                const lastSeen = document.createElement('span');
+                lastSeen.textContent = 'updated ' + last_seen_updated_at;
+                meta.appendChild(lastSeen);
+              }
+
+              left.appendChild(link);
+              left.appendChild(meta);
+              header.appendChild(left);
+
+              const delBtn = document.createElement('button');
+              delBtn.className = 'remove-btn';
+              delBtn.textContent = 'Remove';
+              delBtn.addEventListener('click', async () => {
+                setMessage('Removing PR #' + pr_number + '...');
+                const res = await fetch('/track/' + pr_number, { method: 'DELETE' });
+                if (res.ok) {
+                  setMessage('Removed PR #' + pr_number, 'success');
+                  refreshList();
+                } else {
+                  const err = await res.json().catch(() => ({}));
+                  setMessage('Failed to remove: ' + (err.error || res.status), 'error');
+                }
+              });
+              header.appendChild(delBtn);
+              li.appendChild(header);
+
+              if (failed_checks && failed_checks.length > 0) {
+                const failDiv = document.createElement('div');
+                failDiv.className = 'failures';
+                const failTitle = document.createElement('div');
+                failTitle.className = 'failures-title';
+                failTitle.textContent = 'Failed Checks (' + failed_checks.length + ')';
+                failDiv.appendChild(failTitle);
+
+                const failList = document.createElement('div');
+                failList.className = 'failures-list';
+                failed_checks.forEach((check) => {
+                  const failBadge = document.createElement('span');
+                  failBadge.className = 'failure-badge';
+                  failBadge.textContent = check;
+                  failList.appendChild(failBadge);
+                });
+                failDiv.appendChild(failList);
+                li.appendChild(failDiv);
+              }
+
+              listEl.appendChild(li);
+            });
+          } catch (e) {
+            listEl.innerHTML = '<li class="empty-state" style="color: #b91c1c;">Failed to load PRs</li>';
+          }
+        }
+
+        document.getElementById('add-btn').addEventListener('click', async () => {
+          const num = Number(inputEl.value);
+          if (!num || num <= 0) {
+            setMessage('Please enter a valid PR number', 'error');
+            return;
+          }
+          setMessage('Tracking PR #' + num + '...');
+          try {
+            const res = await fetch('/track/' + num, { method: 'POST' });
+            if (res.ok) {
+              setMessage('Tracking PR #' + num, 'success');
+              inputEl.value = '';
+              refreshList();
+            } else {
+              const err = await res.json().catch(() => ({}));
+              setMessage('Failed to track: ' + (err.error || res.status), 'error');
+            }
+          } catch (e) {
+            setMessage('Network error while tracking', 'error');
+          }
+        });
+
+        inputEl.addEventListener('keypress', (e) => {
+          if (e.key === 'Enter') {
+            document.getElementById('add-btn').click();
+          }
+        });
+
+        refreshList();
+      </script>
+    </body>
+  </html>`;
+  return c.html(html);
+});
+
+export default {
+  fetch: app.fetch,
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(runCronWithMeta(event, env));
+  },
+};
