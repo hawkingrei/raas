@@ -563,19 +563,47 @@ app.get('/prs', async (c) => {
 });
 
 app.get('/', async (c) => {
-  let lastCronText = 'Never';
-  let nextCronText = 'Unknown';
+  let lastCronIso: string | null = null;
+  let lastCronStatus: string | null = null;
+  let nextCronIso: string | null = null;
+  let nextScanIso: string | null = null;
+  let lastScanIso: string | null = null;
   const row = await c.env.DB.prepare(
     'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
   ).first<{ started_at: string; status: string }>();
   if (row) {
-    lastCronText = `${row.started_at} (${row.status})`;
+    lastCronIso = row.started_at;
+    lastCronStatus = row.status;
     const lastMs = Date.parse(row.started_at);
     if (Number.isFinite(lastMs)) {
       const nextMs = lastMs + CRON_INTERVAL_MINUTES * 60 * 1000;
-      nextCronText = new Date(nextMs).toISOString();
+      nextCronIso = new Date(nextMs).toISOString();
     }
   }
+
+  const scanIntervalMinutes = parseNumber(c.env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
+  const lastScan = await getSetting(c.env, 'last_scan_at');
+  if (lastScan) {
+    lastScanIso = lastScan;
+    const lastScanMs = Date.parse(lastScan);
+    if (Number.isFinite(lastScanMs)) {
+      const nextScanMs = lastScanMs + scanIntervalMinutes * 60 * 1000;
+      nextScanIso = new Date(nextScanMs).toISOString();
+    }
+  }
+
+  const lastCronSpan = lastCronIso
+    ? `<span id="last-cron" class="ts" data-iso="${lastCronIso}" data-suffix=" (${lastCronStatus ?? 'unknown'})"></span>`
+    : '<span id="last-cron">Never</span>';
+  const nextCronSpan = nextCronIso
+    ? `<span id="next-cron" class="ts" data-iso="${nextCronIso}"></span>`
+    : '<span id="next-cron">Unknown</span>';
+  const nextScanSpan = nextScanIso
+    ? `<span id="next-scan" class="ts" data-iso="${nextScanIso}"></span>`
+    : '<span id="next-scan">Unknown</span>';
+  const lastScanSpan = lastScanIso
+    ? `<span id="last-scan" class="ts" data-iso="${lastScanIso}"></span>`
+    : '<span id="last-scan">Unknown</span>';
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -665,6 +693,13 @@ app.get('/', async (c) => {
           font-size: 12px;
         }
         .remove-btn:hover { background: #fee2e2; color: #b91c1c; }
+        .copy-btn {
+          background: #e0f2fe;
+          color: #0369a1;
+          padding: 8px 12px;
+          font-size: 12px;
+        }
+        .copy-btn:hover { background: #bae6fd; color: #0c4a6e; }
         .list-section h2 {
           font-size: 18px;
           margin: 0 0 16px 0;
@@ -772,7 +807,7 @@ app.get('/', async (c) => {
     <body>
       <div class="container">
         <h1>Retest as a Service</h1>
-        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronText} • Next cron: ${nextCronText}</div>
+        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan} • Last scan: ${lastScanSpan} • Next check: ${nextScanSpan} • Timezone: <span id="tz-label"></span></div>
 
         <div class="card add-section">
           <h2>Track PR</h2>
@@ -795,10 +830,42 @@ app.get('/', async (c) => {
         const msgEl = document.getElementById('message');
         const inputEl = document.getElementById('pr-input');
         const listEl = document.getElementById('pr-list');
+        const timeFormatter = new Intl.DateTimeFormat(undefined, {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+          timeZoneName: 'short',
+        });
 
         function setMessage(text, type = '') {
           msgEl.textContent = text || '';
           msgEl.className = 'msg ' + (type || '');
+        }
+
+        function formatTimestamp(iso) {
+          if (!iso) return '';
+          const date = new Date(iso);
+          if (Number.isNaN(date.getTime())) return iso;
+          return timeFormatter.format(date);
+        }
+
+        function applyLocalTimeLabels(root = document) {
+          const nodes = root.querySelectorAll('[data-iso]');
+          nodes.forEach((node) => {
+            const iso = node.dataset.iso;
+            if (!iso) return;
+            const prefix = node.dataset.prefix || '';
+            const suffix = node.dataset.suffix || '';
+            node.textContent = prefix + formatTimestamp(iso) + suffix;
+          });
+          const tzEl = document.getElementById('tz-label');
+          if (tzEl) {
+            tzEl.textContent = timeFormatter.resolvedOptions().timeZone || 'local';
+          }
         }
 
         async function refreshList() {
@@ -846,6 +913,8 @@ app.get('/', async (c) => {
               if (next_retest_at) {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
+                nextBadge.dataset.iso = next_retest_at;
+                nextBadge.dataset.prefix = 'next ';
                 nextBadge.textContent = 'next ' + next_retest_at;
                 meta.appendChild(nextBadge);
               }
@@ -859,12 +928,16 @@ app.get('/', async (c) => {
 
               if (last_seen_updated_at) {
                 const lastSeen = document.createElement('span');
+                lastSeen.dataset.iso = last_seen_updated_at;
+                lastSeen.dataset.prefix = 'updated ';
                 lastSeen.textContent = 'updated ' + last_seen_updated_at;
                 meta.appendChild(lastSeen);
               }
 
               if (last_check_at) {
                 const lastCheck = document.createElement('span');
+                lastCheck.dataset.iso = last_check_at;
+                lastCheck.dataset.prefix = 'checked ';
                 lastCheck.textContent = 'checked ' + last_check_at;
                 meta.appendChild(lastCheck);
               }
@@ -888,6 +961,32 @@ app.get('/', async (c) => {
                 }
               });
               header.appendChild(delBtn);
+
+              const copyBtn = document.createElement('button');
+              copyBtn.className = 'copy-btn';
+              copyBtn.textContent = 'Copy ID';
+              copyBtn.addEventListener('click', async () => {
+                const text = String(pr_number);
+                try {
+                  if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(text);
+                  } else {
+                    const temp = document.createElement('textarea');
+                    temp.value = text;
+                    temp.setAttribute('readonly', 'true');
+                    temp.style.position = 'absolute';
+                    temp.style.left = '-9999px';
+                    document.body.appendChild(temp);
+                    temp.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(temp);
+                  }
+                  setMessage('Copied PR #' + pr_number, 'success');
+                } catch (e) {
+                  setMessage('Failed to copy PR #' + pr_number, 'error');
+                }
+              });
+              header.appendChild(copyBtn);
               li.appendChild(header);
 
               if (failed_checks && failed_checks.length > 0) {
@@ -946,6 +1045,7 @@ app.get('/', async (c) => {
 
               listEl.appendChild(li);
             });
+            applyLocalTimeLabels(listEl);
           } catch (e) {
             listEl.innerHTML = '<li class="empty-state" style="color: #b91c1c;">Failed to load PRs</li>';
           }
@@ -980,6 +1080,8 @@ app.get('/', async (c) => {
         });
 
         refreshList();
+        applyLocalTimeLabels();
+        setInterval(() => applyLocalTimeLabels(), 60 * 1000);
       </script>
     </body>
   </html>`;
