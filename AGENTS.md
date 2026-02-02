@@ -38,7 +38,7 @@ Requirements:
    - UI should mimic ./raas style.
    - PRs must be registered via UI; unregistered PRs must not be checked.
    - Removing a PR should also delete retest_state and retest_attempts.
-   - UI shows tracked PRs, last check status/time, last error, and status log.
+   - UI shows tracked PRs, last check status/time (success/failed/ignored/running), last error, and status log.
 
 7. Tech stack:
    - Rust + TypeScript.

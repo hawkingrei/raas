@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 
-type CheckStatus = 'ignored' | 'success' | 'failed';
+type CheckStatus = 'ignored' | 'success' | 'failed' | 'running';
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
 type RetestStateRow = {
@@ -123,19 +123,33 @@ type CommitStatusResponse = {
   statuses: Array<{ context: string; state: string }>;
 };
 
-async function getFailedChecks(sha: string, token: string): Promise<string[]> {
+type CheckStateSummary = {
+  failed: string[];
+  hasPending: boolean;
+};
+
+async function getCheckStateSummary(sha: string, token: string): Promise<CheckStateSummary> {
   const data = await githubRequest<CommitStatusResponse>(
     `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
     token
   );
 
-  return data.statuses
-    .filter((s) => s.state === 'failure' || s.state === 'error')
-    .map((s) => s.context);
+  const failed: string[] = [];
+  let hasPending = false;
+  for (const status of data.statuses) {
+    if (status.state === 'failure' || status.state === 'error') {
+      failed.push(status.context);
+    } else if (status.state === 'pending') {
+      hasPending = true;
+    }
+  }
+
+  return { failed, hasPending };
 }
 
 function classifyChecks(
   failedChecks: string[],
+  hasPending: boolean,
   blacklist: Set<string>
 ): { status: CheckStatus; shouldRetest: boolean; log: string } {
   if (failedChecks.includes(BLOCKED_CHECK)) {
@@ -144,8 +158,11 @@ function classifyChecks(
   if (failedChecks.some((name) => blacklist.has(name))) {
     return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
   }
-  if (failedChecks.length === 0) {
+  if (failedChecks.length === 0 && !hasPending) {
     return { status: 'success', shouldRetest: false, log: 'No failed checks' };
+  }
+  if (failedChecks.length === 0 && hasPending) {
+    return { status: 'running', shouldRetest: false, log: 'Checks pending' };
   }
   return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
@@ -326,9 +343,9 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const updatedMs = Date.parse(pr.updated_at);
     if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
 
-    const failedChecks = await getFailedChecks(pr.head.sha, token);
-    const checkResult = classifyChecks(failedChecks, blacklist);
-    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+    const summary = await getCheckStateSummary(pr.head.sha, token);
+    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+    await upsertRetestState(env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
     if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -474,11 +491,11 @@ app.post('/track/:num', async (c) => {
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
     const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
-    const failedChecks = await getFailedChecks(pr.head.sha, c.env.GITHUB_TOKEN);
-    const checkResult = classifyChecks(failedChecks, blacklist);
+    const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
+    const checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
 
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
-    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+    await upsertRetestState(c.env, pr, summary.failed, checkResult.status, nowIso(), checkResult.log);
 
     const state = await getRetestState(c.env, num);
     if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -714,6 +731,7 @@ app.get('/', async (c) => {
         .badge-success { background: #dcfce7; color: #166534; }
         .badge-failed { background: #fee2e2; color: #b91c1c; }
         .badge-ignored { background: #e2e8f0; color: #475569; }
+        .badge-running { background: #fef9c3; color: #92400e; }
         .badge-unknown { background: #e2e8f0; color: #475569; }
         .failures {
           margin-top: 10px;
@@ -909,7 +927,7 @@ app.get('/', async (c) => {
                 li.appendChild(errDiv);
               }
 
-              if (last_status_log) {
+              if (last_status_log && failed_checks && failed_checks.length > 0) {
                 const logDiv = document.createElement('div');
                 logDiv.className = 'failures';
                 const logTitle = document.createElement('div');
