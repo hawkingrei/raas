@@ -822,7 +822,7 @@ app.get('/', async (c) => {
         <div class="subtitle">
           <div class="subtitle-line">pingcap/tidb</div>
           <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
-          <div class="subtitle-line">Next scan: ${nextScanSpan} • Timezone: <span id="tz-label"></span></div>
+          <div class="subtitle-line">Next scan: ${nextScanSpan}</div>
         </div>
 
         <div class="card add-section">
@@ -878,10 +878,6 @@ app.get('/', async (c) => {
             const suffix = node.dataset.suffix || '';
             node.textContent = prefix + formatTimestamp(iso) + suffix;
           });
-          const tzEl = document.getElementById('tz-label');
-          if (tzEl) {
-            tzEl.textContent = timeFormatter.resolvedOptions().timeZone || 'local';
-          }
         }
 
         async function refreshList() {
