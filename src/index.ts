@@ -495,7 +495,9 @@ app.post('/track/:num', async (c) => {
 
     return c.json({ ok: true, pr_number: num, status: checkResult.status });
   } catch (error) {
-    return c.json({ error: 'Failed to load PR from GitHub' }, 404);
+    const message = error instanceof Error ? error.message : String(error);
+    const isNotFound = message.includes('404');
+    return c.json({ error: isNotFound ? 'PR not found in GitHub' : 'Failed to process PR' }, isNotFound ? 404 : 500);
   }
 });
 
