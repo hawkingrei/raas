@@ -948,6 +948,7 @@ app.get('/', async (c) => {
 
               const delBtn = document.createElement('button');
               delBtn.className = 'remove-btn';
+              delBtn.type = 'button';
               delBtn.textContent = 'Remove';
               delBtn.addEventListener('click', async () => {
                 setMessage('Removing PR #' + pr_number + '...');
@@ -960,10 +961,9 @@ app.get('/', async (c) => {
                   setMessage('Failed to remove: ' + (err.error || res.status), 'error');
                 }
               });
-              header.appendChild(delBtn);
-
               const copyBtn = document.createElement('button');
               copyBtn.className = 'copy-btn';
+              copyBtn.type = 'button';
               copyBtn.textContent = 'Copy ID';
               copyBtn.addEventListener('click', async () => {
                 const text = String(pr_number);
@@ -986,7 +986,8 @@ app.get('/', async (c) => {
                   setMessage('Failed to copy PR #' + pr_number, 'error');
                 }
               });
-              header.appendChild(copyBtn);
+              left.appendChild(copyBtn);
+              header.appendChild(delBtn);
               li.appendChild(header);
 
               if (failed_checks && failed_checks.length > 0) {
