@@ -9,6 +9,8 @@ type RetestStateRow = {
   last_seen_updated_at: string | null;
   last_check_status: string | null;
   last_check_at: string | null;
+  last_error_message: string | null;
+  last_status_log: string | null;
 };
 
 type RetestAttemptRow = {
@@ -37,6 +39,7 @@ const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
 const BACKOFF_MINUTES = [0, 10, 20, 4, 360];
+const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const MASTER_BRANCH = 'master';
@@ -157,17 +160,20 @@ async function getFailedChecks(sha: string, token: string): Promise<string[]> {
     .map((s) => s.context);
 }
 
-function classifyChecks(failedChecks: string[], blacklist: Set<string>): { status: string; shouldRetest: boolean } {
+function classifyChecks(
+  failedChecks: string[],
+  blacklist: Set<string>
+): { status: string; shouldRetest: boolean; log: string } {
   if (failedChecks.includes(BLOCKED_CHECK)) {
-    return { status: 'ignored', shouldRetest: false };
+    return { status: 'ignored', shouldRetest: false, log: `Blocked check: ${BLOCKED_CHECK}` };
   }
   if (failedChecks.some((name) => blacklist.has(name))) {
-    return { status: 'ignored', shouldRetest: false };
+    return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
   }
   if (failedChecks.length === 0) {
-    return { status: 'success', shouldRetest: false };
+    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
   }
-  return { status: 'failed', shouldRetest: true };
+  return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
 
 async function postRetestComment(prNumber: number, token: string): Promise<void> {
@@ -198,24 +204,26 @@ async function upsertRetestState(
   pr: PullItem,
   failedChecks: string[],
   status: string,
-  checkedAt: string
+  checkedAt: string,
+  statusLog: string
 ): Promise<void> {
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
-    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks, last_check_status, last_check_at)
-     VALUES (?, 0, ?, ?, ?, ?)
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks, last_check_status, last_check_at, last_status_log)
+     VALUES (?, 0, ?, ?, ?, ?, ?)
      ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
        last_failure_checks = excluded.last_failure_checks,
        last_check_status = excluded.last_check_status,
-       last_check_at = excluded.last_check_at`
+       last_check_at = excluded.last_check_at,
+       last_status_log = excluded.last_status_log`
   )
-    .bind(pr.number, pr.updated_at, failedJson, status, checkedAt)
+    .bind(pr.number, pr.updated_at, failedJson, status, checkedAt, statusLog)
     .run();
 }
 
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
   const row = await env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_check_status, last_check_at
+    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log
      FROM retest_state WHERE pr_number = ?`
   )
     .bind(prNumber)
@@ -241,6 +249,9 @@ async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: num
     await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
       .bind(nowIso(), prNumber)
       .run();
+    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+      .bind('Reached max attempts', prNumber)
+      .run();
     return;
   }
 
@@ -257,12 +268,18 @@ async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: num
   await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
     .bind(scheduledAt, prNumber)
     .run();
+  await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+    .bind(`Scheduled retest at ${scheduledAt}`, prNumber)
+    .run();
 }
 
 async function scheduleImmediateAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
   if (attemptCount >= BACKOFF_MINUTES.length) {
     await env.DB.prepare('UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL WHERE pr_number = ?')
       .bind(nowIso(), prNumber)
+      .run();
+    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+      .bind('Reached max attempts', prNumber)
       .run();
     return;
   }
@@ -278,6 +295,9 @@ async function scheduleImmediateAttempt(env: Env, prNumber: number, attemptCount
 
   await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
     .bind(scheduledAt, prNumber)
+    .run();
+  await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+    .bind('Scheduled immediate retest', prNumber)
     .run();
 }
 
@@ -297,7 +317,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
     if (!tracked.has(pr.number)) continue;
     const failedChecks = await getFailedChecks(pr.head.sha, token);
     const checkResult = classifyChecks(failedChecks, blacklist);
-    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso());
+    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
     if (!checkResult.shouldRetest) continue;
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
@@ -347,9 +367,12 @@ async function executeDueAttempts(env: Env): Promise<void> {
     const nextAttemptCount = state.attempt_count + 1;
     const disable = nextAttemptCount >= BACKOFF_MINUTES.length;
     await env.DB.prepare(
-      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ? WHERE pr_number = ?'
+      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ? WHERE pr_number = ?'
     )
-      .bind(nextAttemptCount, now, disable ? now : null, attempt.pr_number)
+      .bind(nextAttemptCount, now, disable ? now : null, errorMessage, attempt.pr_number)
+      .run();
+    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+      .bind(status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`, attempt.pr_number)
       .run();
   }
 }
@@ -462,7 +485,7 @@ app.post('/webhook/github', async (c) => {
     state: 'closed',
   } as PullItem;
 
-  await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso());
+  await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
   const state = await getRetestState(env, pr.number);
   if (!state) return c.json({ ok: true });
   if (!checkResult.shouldRetest) return c.json({ ok: true });
@@ -471,6 +494,9 @@ app.post('/webhook/github', async (c) => {
     const newCount = Math.max(0, state.attempt_count - 2);
     await env.DB.prepare('UPDATE retest_state SET attempt_count = ?, disabled_at = NULL WHERE pr_number = ?')
       .bind(newCount, pr.number)
+      .run();
+    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
+      .bind(`Reached max attempts, reduced to ${newCount}`, pr.number)
       .run();
   }
 
@@ -497,7 +523,7 @@ app.post('/track/:num', async (c) => {
     const failedChecks = await getFailedChecks(pr.head.sha, c.env.GITHUB_TOKEN);
     const checkResult = classifyChecks(failedChecks, blacklist);
 
-    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso());
+    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
 
     if (checkResult.shouldRetest) {
       const state = await getRetestState(c.env, num);
@@ -535,7 +561,9 @@ app.get('/prs', async (c) => {
             s.last_failure_checks,
             s.last_seen_updated_at,
             s.last_check_status,
-            s.last_check_at
+            s.last_check_at,
+            s.last_error_message,
+            s.last_status_log
      FROM tracked_prs t
      LEFT JOIN retest_state s ON s.pr_number = t.pr_number
      ORDER BY t.pr_number ASC`
@@ -550,6 +578,8 @@ app.get('/prs', async (c) => {
     last_seen_updated_at: row.last_seen_updated_at,
     last_check_status: row.last_check_status ?? 'unknown',
     last_check_at: row.last_check_at,
+    last_error_message: row.last_error_message,
+    last_status_log: row.last_status_log,
     failed_checks: row.last_failure_checks ? JSON.parse(row.last_failure_checks) : [],
   }));
 
@@ -558,10 +588,18 @@ app.get('/prs', async (c) => {
 
 app.get('/', async (c) => {
   let lastCronText = 'Never';
+  let nextCronText = 'Unknown';
   const row = await c.env.DB.prepare(
     'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
   ).first<{ started_at: string; status: string }>();
-  if (row) lastCronText = `${row.started_at} (${row.status})`;
+  if (row) {
+    lastCronText = `${row.started_at} (${row.status})`;
+    const lastMs = Date.parse(row.started_at);
+    if (Number.isFinite(lastMs)) {
+      const nextMs = lastMs + CRON_INTERVAL_MINUTES * 60 * 1000;
+      nextCronText = new Date(nextMs).toISOString();
+    }
+  }
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -757,7 +795,7 @@ app.get('/', async (c) => {
     <body>
       <div class="container">
         <h1>Retest as a Service</h1>
-        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronText}</div>
+        <div class="subtitle">pingcap/tidb • Last cron: ${lastCronText} • Next cron: ${nextCronText}</div>
 
         <div class="card add-section">
           <h2>Track PR</h2>
@@ -799,7 +837,7 @@ app.get('/', async (c) => {
             }
 
             listEl.innerHTML = '';
-            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, failed_checks }) => {
+            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log, failed_checks }) => {
               const li = document.createElement('li');
               li.className = 'pr-item';
 
@@ -893,6 +931,40 @@ app.get('/', async (c) => {
                 });
                 failDiv.appendChild(failList);
                 li.appendChild(failDiv);
+              }
+
+              if (last_error_message) {
+                const errDiv = document.createElement('div');
+                errDiv.className = 'failures';
+                const errTitle = document.createElement('div');
+                errTitle.className = 'failures-title';
+                errTitle.textContent = 'Last Error';
+                errDiv.appendChild(errTitle);
+                const errText = document.createElement('div');
+                errText.style.whiteSpace = 'pre-wrap';
+                errText.style.fontFamily = \"'Consolas', 'Monaco', monospace\";
+                errText.style.fontSize = '12px';
+                errText.style.color = '#b91c1c';
+                errText.textContent = last_error_message;
+                errDiv.appendChild(errText);
+                li.appendChild(errDiv);
+              }
+
+              if (last_status_log) {
+                const logDiv = document.createElement('div');
+                logDiv.className = 'failures';
+                const logTitle = document.createElement('div');
+                logTitle.className = 'failures-title';
+                logTitle.textContent = 'Status Log';
+                logDiv.appendChild(logTitle);
+                const logText = document.createElement('div');
+                logText.style.whiteSpace = 'pre-wrap';
+                logText.style.fontFamily = \"'Consolas', 'Monaco', monospace\";
+                logText.style.fontSize = '12px';
+                logText.style.color = '#475569';
+                logText.textContent = last_status_log;
+                logDiv.appendChild(logText);
+                li.appendChild(logDiv);
               }
 
               listEl.appendChild(li);

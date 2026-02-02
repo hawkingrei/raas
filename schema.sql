@@ -6,6 +6,8 @@ CREATE TABLE IF NOT EXISTS retest_state (
   last_failure_checks TEXT NULL,
   last_check_status TEXT NULL,
   last_check_at TEXT NULL,
+  last_error_message TEXT NULL,
+  last_status_log TEXT NULL,
   next_retest_at TEXT NULL,
   last_retest_at TEXT NULL,
   disabled_at TEXT NULL
