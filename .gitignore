@@ -1,6 +1,5 @@
-wrangler.toml
 node_modules
 .env
 .wrangler
 .DS_Store
-.cache
+wrangler.toml
