@@ -81,7 +81,7 @@ async function githubRequest<T>(path: string, token: string, init?: RequestInit)
   const response = await fetch(`https://api.github.com${path}`, {
     ...init,
     headers: {
-      'Authorization': `token ${token}`,
+      'Authorization': `Authorization: Bearer ${token}`,
       'Accept': 'application/vnd.github.v3+json',
       'X-GitHub-Api-Version': '2022-11-28',
       'User-Agent': 'retest-as-a-service',
