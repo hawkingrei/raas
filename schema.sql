@@ -4,6 +4,10 @@ CREATE TABLE IF NOT EXISTS retest_state (
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_seen_updated_at TEXT NULL,
   last_failure_checks TEXT NULL,
+  last_check_status TEXT NULL,
+  last_check_at TEXT NULL,
+  last_error_message TEXT NULL,
+  last_status_log TEXT NULL,
   next_retest_at TEXT NULL,
   last_retest_at TEXT NULL,
   disabled_at TEXT NULL

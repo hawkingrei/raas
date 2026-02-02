@@ -8,10 +8,12 @@ Requirements:
 
 1. Scheduled scan of PRs updated within the last 2 days.
    - If GitHub CI status fails, post a `/retest` comment.
-   - Retest is gated by a failure whitelist and backoff rules.
+   - Retest is gated by a failure blacklist and backoff rules.
 
 2. Failure blacklist:
    - If any failed check name is in the blacklist, ignore it and do not retest.
+   - Hard block: if `fast_test_tiprow` fails, do not retest.
+   - Current blacklist: `license/cla`, `pull-error-log-review`, `tide`, `check-issue-triage-complete`.
 
 3. Backoff rules (per PR/CI attempt counter):
    - 1st retest: immediate.
@@ -20,6 +22,7 @@ Requirements:
    - 4th: wait 4 minutes.
    - 5th: wait 6 hours.
    - 6th and beyond: stop automatic retest.
+   - If `attempt_count >= 5`, only reset to 0 after CI is confirmed recovered (no failures).
 
 4. Scan and concurrency:
    - Retest check interval is configurable.
@@ -29,15 +32,13 @@ Requirements:
    - Timezone: Asia/Shanghai. Day max = 2, Night max = 5.
 
 5. Webhook:
-   - Only handle merge to master.
-   - On merge to master, immediately check if the PR is failing.
-   - If attempt_count has reached the limit (attempt_count = 5), reduce by 2 (e.g. 5 -> 3) to allow retest again.
-   - For non-limited PRs, start immediately but still honor max concurrency.
+   - Webhook handling is paused/disabled for now.
 
 6. UI:
    - UI should mimic ./raas style.
    - PRs must be registered via UI; unregistered PRs must not be checked.
    - Removing a PR should also delete retest_state and retest_attempts.
+   - UI shows tracked PRs, last check status/time, last error, and status log.
 
 7. Tech stack:
    - Rust + TypeScript.
