@@ -297,24 +297,29 @@ async function scanAndSchedule(env: Env): Promise<void> {
   const lookbackHours = parseNumber(env.SCAN_LOOKBACK_HOURS, DEFAULT_LOOKBACK_HOURS);
   const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
 
-  const tracked = new Set(await getTrackedPrNumbers(env));
-  if (tracked.size === 0) {
+  const tracked = await getTrackedPrNumbers(env);
+  if (tracked.length === 0) {
     console.log('No tracked PRs, skipping scan.');
     return;
   }
 
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
-  for (const prNumber of tracked) {
-    let pr: PullDetail;
-    try {
-      pr = await getPullByNumber(token, prNumber);
-    } catch (error) {
-      console.error(`Failed to fetch PR #${prNumber}:`, error);
+  const prPromises = tracked.map((prNumber) =>
+    getPullByNumber(token, prNumber)
+      .then((pr) => ({ status: 'fulfilled' as const, value: pr, prNumber }))
+      .catch((error) => ({ status: 'rejected' as const, reason: error, prNumber }))
+  );
+  const results = await Promise.all(prPromises);
+
+  for (const result of results) {
+    if (result.status === 'rejected') {
+      console.error(`Failed to fetch PR #${result.prNumber}:`, result.reason);
       continue;
     }
+    const pr = result.value;
 
     if (pr.state !== 'open') {
-      await deleteTrackedPrData(env, prNumber);
+      await deleteTrackedPrData(env, result.prNumber);
       continue;
     }
 
@@ -376,13 +381,11 @@ async function executeDueAttempts(env: Env): Promise<void> {
 
     const nextAttemptCount = state.attempt_count + 1;
     const disable = nextAttemptCount >= BACKOFF_MINUTES.length;
+    const statusLog = status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`;
     await env.DB.prepare(
-      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ? WHERE pr_number = ?'
+      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ? WHERE pr_number = ?'
     )
-      .bind(nextAttemptCount, now, disable ? now : null, errorMessage, attempt.pr_number)
-      .run();
-    await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-      .bind(status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`, attempt.pr_number)
+      .bind(nextAttemptCount, now, disable ? now : null, errorMessage, statusLog, attempt.pr_number)
       .run();
 
   }
