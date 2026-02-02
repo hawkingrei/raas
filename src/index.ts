@@ -709,6 +709,12 @@ app.get('/', async (c) => {
           font-size: 12px;
           line-height: 1;
         }
+        .copy-btn svg {
+          width: 14px;
+          height: 14px;
+          display: block;
+          stroke: currentColor;
+        }
         .copy-btn:hover { color: #0ea5e9; }
         .copy-btn:active { transform: translateY(1px); }
         .list-section h2 {
@@ -981,7 +987,7 @@ app.get('/', async (c) => {
               copyBtn.className = 'copy-btn';
               copyBtn.type = 'button';
               copyBtn.setAttribute('aria-label', 'Copy PR ID');
-              copyBtn.textContent = '⧉';
+              copyBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><rect x="4" y="4" width="11" height="11" rx="2"></rect></svg>';
               copyBtn.addEventListener('click', async () => {
                 const text = String(pr_number);
                 try {
