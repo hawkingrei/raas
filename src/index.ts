@@ -81,7 +81,7 @@ async function githubRequest<T>(path: string, token: string, init?: RequestInit)
   const response = await fetch(`https://api.github.com${path}`, {
     ...init,
     headers: {
-      'Authorization': `Authorization: Bearer ${token}`,
+      'Authorization': `token ${token}`,
       'Accept': 'application/vnd.github.v3+json',
       'X-GitHub-Api-Version': '2022-11-28',
       'User-Agent': 'retest-as-a-service',
@@ -156,7 +156,7 @@ async function postRetestComment(prNumber: number, token: string): Promise<void>
     token,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'Accept: application/vnd.github+json' },
       body: JSON.stringify({ body: '/retest' }),
     }
   );
