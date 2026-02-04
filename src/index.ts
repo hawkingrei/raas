@@ -563,7 +563,15 @@ app.get('/prs', async (c) => {
             s.last_status_log
      FROM tracked_prs t
      LEFT JOIN retest_state s ON s.pr_number = t.pr_number
-     ORDER BY t.pr_number ASC`
+     ORDER BY
+       CASE COALESCE(s.last_check_status, 'unknown')
+         WHEN 'running' THEN 0
+         WHEN 'failed'  THEN 1
+         WHEN 'ignored' THEN 2
+         ELSE 3
+       END,
+       COALESCE(s.attempt_count, 0) ASC,
+       t.pr_number ASC`
   )
     .all<RetestStateRow>();
 
