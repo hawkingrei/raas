@@ -258,14 +258,18 @@ async function deleteTrackedPrData(env: Env, prNumber: number): Promise<void> {
 }
 
 async function resetAttemptsIfRecovered(env: Env, prNumber: number): Promise<void> {
-  await env.DB.prepare(
-    'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
-  )
-    .bind('CI recovered, reset attempts', prNumber)
-    .run();
-  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
-    .bind(prNumber)
-    .run();
+  await resetAttempts(env, prNumber, 'CI recovered, reset attempts');
+}
+
+async function resetAttempts(env: Env, prNumber: number, statusLog: string): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
+    )
+      .bind(statusLog, prNumber),
+    env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
+      .bind(prNumber),
+  ]);
 }
 
 async function resetAttemptsIfHeadChanged(
@@ -274,14 +278,29 @@ async function resetAttemptsIfHeadChanged(
   previousHeadSha: string,
   latestHeadSha: string
 ): Promise<void> {
-  await env.DB.prepare(
-    'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
-  )
-    .bind(`Head changed ${previousHeadSha.slice(0, 8)} -> ${latestHeadSha.slice(0, 8)}, reset attempts`, prNumber)
-    .run();
-  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
-    .bind(prNumber)
-    .run();
+  await resetAttempts(
+    env,
+    prNumber,
+    `Head changed ${previousHeadSha.slice(0, 8)} -> ${latestHeadSha.slice(0, 8)}, reset attempts`
+  );
+}
+
+async function upsertStateAndResetIfHeadChanged(
+  env: Env,
+  pr: PullItem,
+  failedChecks: string[],
+  checkResult: { status: CheckStatus; shouldRetest: boolean; log: string }
+): Promise<RetestStateRow | null> {
+  const previousState = await getRetestState(env, pr.number);
+  const previousHeadSha = previousState?.last_seen_head_sha;
+  const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
+
+  await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+  if (headChanged && previousHeadSha) {
+    await resetAttemptsIfHeadChanged(env, pr.number, previousHeadSha, pr.head.sha);
+  }
+
+  return await getRetestState(env, pr.number);
 }
 
 async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAttemptRow | null> {
@@ -395,16 +414,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
       failedChecks = summary.failed;
       checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
     }
-    const previousState = await getRetestState(env, pr.number);
-    const previousHeadSha = previousState?.last_seen_head_sha;
-    const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
-
-    await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
-    if (headChanged && previousHeadSha) {
-      await resetAttemptsIfHeadChanged(env, pr.number, previousHeadSha, pr.head.sha);
-    }
-
-    const state = await getRetestState(env, pr.number);
+    const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
     if (!state) continue;
     if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
       await resetAttemptsIfRecovered(env, pr.number);
@@ -559,17 +569,8 @@ app.post('/track/:num', async (c) => {
       checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
     }
 
-    const previousState = await getRetestState(c.env, num);
-    const previousHeadSha = previousState?.last_seen_head_sha;
-    const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
-
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
-    await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
-    if (headChanged && previousHeadSha) {
-      await resetAttemptsIfHeadChanged(c.env, num, previousHeadSha, pr.head.sha);
-    }
-
-    const state = await getRetestState(c.env, num);
+    const state = await upsertStateAndResetIfHeadChanged(c.env, pr, failedChecks, checkResult);
     if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
       await resetAttemptsIfRecovered(c.env, num);
       return c.json({ ok: true, pr_number: num, status: checkResult.status });
