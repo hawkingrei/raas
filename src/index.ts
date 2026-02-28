@@ -10,6 +10,7 @@ type RetestStateRow = {
   disabled_at: string | null;
   last_failure_checks: string | null;
   last_seen_updated_at: string | null;
+  last_seen_head_sha: string | null;
   last_check_status: CheckStatusWithUnknown | null;
   last_check_at: string | null;
   last_error_message: string | null;
@@ -41,11 +42,12 @@ const DEFAULT_LOOKBACK_HOURS = 48;
 const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
-const BACKOFF_MINUTES = [0, 10, 20, 4, 360];
+const BACKOFF_MINUTES = [0, 10, 20, 40, 360];
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const BLOCKED_CHECK = 'fast_test_tiprow';
+let retestStateHeadShaColumnEnsured = false;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -197,6 +199,21 @@ async function setSetting(env: Env, key: string, value: string): Promise<void> {
     .run();
 }
 
+async function ensureRetestStateHeadShaColumn(env: Env): Promise<void> {
+  if (retestStateHeadShaColumnEnsured) return;
+
+  try {
+    await env.DB.prepare('ALTER TABLE retest_state ADD COLUMN last_seen_head_sha TEXT NULL').run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('duplicate column name: last_seen_head_sha')) {
+      throw error;
+    }
+  }
+
+  retestStateHeadShaColumnEnsured = true;
+}
+
 async function upsertRetestState(
   env: Env,
   pr: PullItem,
@@ -205,23 +222,26 @@ async function upsertRetestState(
   checkedAt: string,
   statusLog: string
 ): Promise<void> {
+  await ensureRetestStateHeadShaColumn(env);
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
-    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_failure_checks, last_check_status, last_check_at, last_status_log)
-     VALUES (?, 0, ?, ?, ?, ?, ?)
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_status_log)
+     VALUES (?, 0, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
+       last_seen_head_sha = excluded.last_seen_head_sha,
        last_failure_checks = excluded.last_failure_checks,
        last_check_status = excluded.last_check_status,
        last_check_at = excluded.last_check_at,
        last_status_log = excluded.last_status_log`
   )
-    .bind(pr.number, pr.updated_at, failedJson, status, checkedAt, statusLog)
+    .bind(pr.number, pr.updated_at, pr.head.sha, failedJson, status, checkedAt, statusLog)
     .run();
 }
 
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
+  await ensureRetestStateHeadShaColumn(env);
   const row = await env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log
+    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
      FROM retest_state WHERE pr_number = ?`
   )
     .bind(prNumber)
@@ -242,6 +262,22 @@ async function resetAttemptsIfRecovered(env: Env, prNumber: number): Promise<voi
     'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
   )
     .bind('CI recovered, reset attempts', prNumber)
+    .run();
+  await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
+    .bind(prNumber)
+    .run();
+}
+
+async function resetAttemptsIfHeadChanged(
+  env: Env,
+  prNumber: number,
+  previousHeadSha: string,
+  latestHeadSha: string
+): Promise<void> {
+  await env.DB.prepare(
+    'UPDATE retest_state SET attempt_count = 0, disabled_at = NULL, next_retest_at = NULL, last_error_message = NULL, last_status_log = ? WHERE pr_number = ?'
+  )
+    .bind(`Head changed ${previousHeadSha.slice(0, 8)} -> ${latestHeadSha.slice(0, 8)}, reset attempts`, prNumber)
     .run();
   await env.DB.prepare('DELETE FROM retest_attempts WHERE pr_number = ? AND executed_at IS NULL')
     .bind(prNumber)
@@ -359,7 +395,15 @@ async function scanAndSchedule(env: Env): Promise<void> {
       failedChecks = summary.failed;
       checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
     }
+    const previousState = await getRetestState(env, pr.number);
+    const previousHeadSha = previousState?.last_seen_head_sha;
+    const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
+
     await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+    if (headChanged && previousHeadSha) {
+      await resetAttemptsIfHeadChanged(env, pr.number, previousHeadSha, pr.head.sha);
+    }
+
     const state = await getRetestState(env, pr.number);
     if (!state) continue;
     if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -515,8 +559,15 @@ app.post('/track/:num', async (c) => {
       checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
     }
 
+    const previousState = await getRetestState(c.env, num);
+    const previousHeadSha = previousState?.last_seen_head_sha;
+    const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
+
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
     await upsertRetestState(c.env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+    if (headChanged && previousHeadSha) {
+      await resetAttemptsIfHeadChanged(c.env, num, previousHeadSha, pr.head.sha);
+    }
 
     const state = await getRetestState(c.env, num);
     if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
@@ -557,6 +608,7 @@ app.get('/prs', async (c) => {
             s.disabled_at,
             s.last_failure_checks,
             s.last_seen_updated_at,
+            s.last_seen_head_sha,
             COALESCE(s.last_check_status, 'unknown') AS last_check_status,
             s.last_check_at,
             s.last_error_message,
