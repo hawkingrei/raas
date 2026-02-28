@@ -19,10 +19,11 @@ Requirements:
    - 1st retest: immediate.
    - 2nd: wait 10 minutes.
    - 3rd: wait 20 minutes.
-   - 4th: wait 4 minutes.
+   - 4th: wait 40 minutes.
    - 5th: wait 6 hours.
    - 6th and beyond: stop automatic retest.
    - If `attempt_count >= 5`, only reset to 0 after CI is confirmed recovered (no failures).
+   - If latest PR head commit SHA differs from persisted state, reset `attempt_count` to 0.
 
 4. Scan and concurrency:
    - Retest check interval is configurable.

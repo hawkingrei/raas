@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS retest_state (
   pr_number INTEGER PRIMARY KEY,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   last_seen_updated_at TEXT NULL,
+  last_seen_head_sha TEXT NULL,
   last_failure_checks TEXT NULL,
   last_check_status TEXT NULL,
   last_check_at TEXT NULL,
