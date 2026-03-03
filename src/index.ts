@@ -157,7 +157,7 @@ async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number)
       const createdMs = Date.parse(pr.created_at);
       if (!Number.isFinite(createdMs) || createdMs < cutoffMs) {
         reachedOlder = true;
-        continue;
+        break;
       }
       pulls.push(pr);
     }
@@ -166,6 +166,30 @@ async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number)
   }
 
   return pulls;
+}
+
+async function getOkToTestSkipReason(
+  pr: PullListItem,
+  ownersAliasesUsers: Set<string>,
+  token: string
+): Promise<string | null> {
+  if (hasLabel(pr.labels, 'ok-to-test')) {
+    return 'ok-to-test label already exists';
+  }
+
+  const authorLogin = pr.user?.login ? normalizeLogin(pr.user.login) : '';
+  if (!authorLogin) {
+    return 'PR author is missing';
+  }
+  if (!ownersAliasesUsers.has(authorLogin)) {
+    return `Author ${authorLogin} is not in OWNERS_ALIASES`;
+  }
+
+  if (await hasFastTestTiprowTriggered(pr.head.sha, token)) {
+    return `${BLOCKED_CHECK} already triggered`;
+  }
+
+  return null;
 }
 
 async function getTrackedPrNumbers(env: Env): Promise<number[]> {
@@ -643,43 +667,14 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
       continue;
     }
 
-    if (hasLabel(pr.labels, 'ok-to-test')) {
+    const skipReason = await getOkToTestSkipReason(pr, ownersAliasesUsers, token);
+    if (skipReason) {
       await upsertOkToTestState(
         env,
         pr.number,
         pr.head.sha,
         'skipped',
-        'ok-to-test label already exists',
-        null
-      );
-      continue;
-    }
-
-    const authorLogin = pr.user?.login ? normalizeLogin(pr.user.login) : '';
-    if (!authorLogin) {
-      await upsertOkToTestState(env, pr.number, pr.head.sha, 'skipped', 'PR author is missing', null);
-      continue;
-    }
-    if (!ownersAliasesUsers.has(authorLogin)) {
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'skipped',
-        `Author ${authorLogin} is not in OWNERS_ALIASES`,
-        null
-      );
-      continue;
-    }
-
-    const triggered = await hasFastTestTiprowTriggered(pr.head.sha, token);
-    if (triggered) {
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'skipped',
-        `${BLOCKED_CHECK} already triggered`,
+        skipReason,
         null
       );
       continue;
