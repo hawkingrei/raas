@@ -36,7 +36,7 @@ export interface Env {
   CHECK_BLACKLIST: string;
   SCAN_LOOKBACK_HOURS?: string;
   SCAN_INTERVAL_MINUTES?: string;
-  OK_TO_TEST_LOOKBACK_HOURS?: string;
+  OK_TO_TEST_LOOKBACK_MINUTES?: string;
   OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
   DAY_MAX_RETESTS?: string;
   NIGHT_MAX_RETESTS?: string;
@@ -48,7 +48,7 @@ const app = new Hono<{ Bindings: Env }>();
 
 const DEFAULT_LOOKBACK_HOURS = 48;
 const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
-const DEFAULT_OK_TO_TEST_LOOKBACK_HOURS = 48;
+const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 2880;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
@@ -144,8 +144,8 @@ async function listOpenMasterPulls(token: string, page: number): Promise<PullLis
   );
 }
 
-async function listRecentOpenMasterPulls(token: string, lookbackHours: number): Promise<PullListItem[]> {
-  const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
+async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number): Promise<PullListItem[]> {
+  const cutoffMs = Date.now() - lookbackMinutes * 60 * 1000;
   const pulls: PullListItem[] = [];
 
   for (let page = 1; page <= 10; page += 1) {
@@ -626,8 +626,11 @@ async function scanAndSchedule(env: Env): Promise<void> {
 
 async function scanAndAutoOkToTest(env: Env): Promise<void> {
   const token = env.GITHUB_TOKEN;
-  const lookbackHours = parseNumber(env.OK_TO_TEST_LOOKBACK_HOURS, DEFAULT_OK_TO_TEST_LOOKBACK_HOURS);
-  const openMasterPrs = await listRecentOpenMasterPulls(token, lookbackHours);
+  const lookbackMinutes = parseNumber(
+    env.OK_TO_TEST_LOOKBACK_MINUTES,
+    DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES
+  );
+  const openMasterPrs = await listRecentOpenMasterPulls(token, lookbackMinutes);
 
   if (openMasterPrs.length === 0) {
     return;

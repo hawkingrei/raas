@@ -17,7 +17,7 @@ CHECK_BLACKLIST = "license/cla,pull-error-log-review,tide,check-issue-triage-com
 # Scan settings
 SCAN_LOOKBACK_HOURS = "48"
 SCAN_INTERVAL_MINUTES = "10"
-OK_TO_TEST_LOOKBACK_HOURS = "48"
+OK_TO_TEST_LOOKBACK_MINUTES = "10"
 OK_TO_TEST_SCAN_INTERVAL_MINUTES = "10"
 
 # Concurrency per scan window (Asia/Shanghai)
