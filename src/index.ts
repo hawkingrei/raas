@@ -53,6 +53,7 @@ const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
 const BACKOFF_MINUTES = [0, 10, 20, 40, 360];
+const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
@@ -211,6 +212,10 @@ type RepoFileResponse = {
   encoding: string;
 };
 
+type IssueComment = {
+  body: string | null;
+};
+
 type CheckStateSummary = {
   failed: string[];
   hasPending: boolean;
@@ -227,6 +232,10 @@ function hasLabel(labels: PullLabel[], expected: string): boolean {
 
 function includesFastTestTiprow(value: string): boolean {
   return value.toLowerCase().includes(BLOCKED_CHECK);
+}
+
+function isOkToTestCommentBody(body: string | null): boolean {
+  return (body ?? '').trim() === '/ok-to-test';
 }
 
 async function getCheckStateSummary(sha: string, token: string): Promise<CheckStateSummary> {
@@ -305,6 +314,23 @@ async function getOwnersAliasesUsers(token: string): Promise<Set<string>> {
   }
   const content = decodeBase64Utf8(response.content);
   return parseOwnersAliasesUsers(content);
+}
+
+async function hasOkToTestComment(prNumber: number, token: string): Promise<boolean> {
+  for (let page = 1; page <= 10; page += 1) {
+    const comments = await githubRequest<IssueComment[]>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      token
+    );
+    if (comments.some((comment) => isOkToTestCommentBody(comment.body))) {
+      return true;
+    }
+    if (comments.length < 100) {
+      break;
+    }
+  }
+
+  return false;
 }
 
 function classifyChecks(
@@ -413,7 +439,7 @@ async function upsertOkToTestState(
   env: Env,
   prNumber: number,
   headSha: string,
-  action: 'commented' | 'skipped' | 'error',
+  action: 'commenting' | 'commented' | 'skipped' | 'error',
   statusLog: string,
   errorMessage: string | null
 ): Promise<void> {
@@ -430,6 +456,36 @@ async function upsertOkToTestState(
   )
     .bind(prNumber, headSha, action, nowIso(), errorMessage, statusLog)
     .run();
+}
+
+async function tryClaimOkToTestComment(env: Env, prNumber: number, headSha: string): Promise<boolean> {
+  await ensureOkToTestStateTable(env);
+
+  const claimedAt = nowIso();
+  const staleThreshold = new Date(Date.now() - OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES * 60 * 1000).toISOString();
+  const result = await env.DB.prepare(
+    `INSERT INTO ok_to_test_state (pr_number, last_seen_head_sha, last_action, last_action_at, last_error_message, last_status_log)
+     VALUES (?, ?, 'commenting', ?, NULL, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET
+       last_seen_head_sha = excluded.last_seen_head_sha,
+       last_action = excluded.last_action,
+       last_action_at = excluded.last_action_at,
+       last_error_message = excluded.last_error_message,
+       last_status_log = excluded.last_status_log
+     WHERE ok_to_test_state.last_action IS NULL
+       OR ok_to_test_state.last_action = 'skipped'
+       OR ok_to_test_state.last_action = 'error'
+       OR (
+         ok_to_test_state.last_action = 'commenting'
+         AND ok_to_test_state.last_action_at IS NOT NULL
+         AND ok_to_test_state.last_action_at < ?
+       )`
+  )
+    .bind(prNumber, headSha, claimedAt, 'Acquired /ok-to-test comment claim', staleThreshold)
+    .run();
+
+  const changes = Number((result.meta as { changes?: number } | undefined)?.changes ?? 0);
+  return changes > 0;
 }
 
 async function upsertRetestState(
@@ -675,6 +731,35 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
         pr.head.sha,
         'skipped',
         skipReason,
+        null
+      );
+      continue;
+    }
+
+    if (await hasOkToTestComment(pr.number, token)) {
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'commented',
+        'Detected existing /ok-to-test comment, skip posting',
+        null
+      );
+      continue;
+    }
+
+    const claimed = await tryClaimOkToTestComment(env, pr.number, pr.head.sha);
+    if (!claimed) {
+      continue;
+    }
+
+    if (await hasOkToTestComment(pr.number, token)) {
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'commented',
+        'Detected existing /ok-to-test comment after claim, skip posting',
         null
       );
       continue;
