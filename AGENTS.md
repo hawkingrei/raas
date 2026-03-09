@@ -1,5 +1,19 @@
 # AGENTS
 
+## 2026-03-03 Auto `/ok-to-test` for Eligible Authors
+
+Requirement:
+
+1. Add a scheduled scan for recently opened PRs targeting `master`.
+2. Scope:
+   - PR does not have `ok-to-test` label.
+   - CI has not triggered `fast_test_tiprow`.
+   - PR author exists in `OWNERS_ALIASES` from `pingcap/tidb`.
+3. Action:
+   - Auto post `/ok-to-test` comment.
+4. De-dup:
+   - For the same PR, do not post duplicate `/ok-to-test` comments.
+
 ## 2026-02-02 CI Auto Retest Service (Cloudflare Worker + D1)
 
 Goal: Build an automatic CI retest service using Cloudflare Worker and Cloudflare D1. UI and interactions should reference the existing ./raas style.

@@ -24,12 +24,20 @@ type RetestAttemptRow = {
   scheduled_at: string;
 };
 
+type OkToTestStateRow = {
+  pr_number: number;
+  last_seen_head_sha: string | null;
+  last_action: string | null;
+};
+
 export interface Env {
   DB: D1Database;
   GITHUB_TOKEN: string;
   CHECK_BLACKLIST: string;
   SCAN_LOOKBACK_HOURS?: string;
   SCAN_INTERVAL_MINUTES?: string;
+  OK_TO_TEST_LOOKBACK_MINUTES?: string;
+  OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
   DAY_MAX_RETESTS?: string;
   NIGHT_MAX_RETESTS?: string;
   TIMEZONE?: string;
@@ -40,14 +48,18 @@ const app = new Hono<{ Bindings: Env }>();
 
 const DEFAULT_LOOKBACK_HOURS = 48;
 const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
+const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
+const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
 const BACKOFF_MINUTES = [0, 10, 20, 40, 360];
+const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const BLOCKED_CHECK = 'fast_test_tiprow';
 let retestStateHeadShaColumnEnsured = false;
+let okToTestStateTableEnsured = false;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -101,6 +113,7 @@ async function githubRequest<T>(path: string, token: string, init?: RequestInit)
 
 type PullItem = {
   number: number;
+  created_at: string;
   updated_at: string;
   head: { sha: string };
   state: string;
@@ -110,11 +123,74 @@ type PullItem = {
 
 type PullDetail = PullItem;
 
+type PullLabel = { name: string };
+
+type PullListItem = PullItem & {
+  base: { ref: string };
+  labels: PullLabel[];
+  user: { login: string } | null;
+};
+
 async function getPullByNumber(token: string, prNumber: number): Promise<PullDetail> {
   return await githubRequest<PullDetail>(
     `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
     token
   );
+}
+
+async function listOpenMasterPulls(token: string, page: number): Promise<PullListItem[]> {
+  return await githubRequest<PullListItem[]>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&base=master&sort=created&direction=desc&per_page=100&page=${page}`,
+    token
+  );
+}
+
+async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number): Promise<PullListItem[]> {
+  const cutoffMs = Date.now() - lookbackMinutes * 60 * 1000;
+  const pulls: PullListItem[] = [];
+
+  for (let page = 1; page <= 10; page += 1) {
+    const items = await listOpenMasterPulls(token, page);
+    if (items.length === 0) break;
+
+    let reachedOlder = false;
+    for (const pr of items) {
+      const createdMs = Date.parse(pr.created_at);
+      if (!Number.isFinite(createdMs) || createdMs < cutoffMs) {
+        reachedOlder = true;
+        break;
+      }
+      pulls.push(pr);
+    }
+
+    if (items.length < 100 || reachedOlder) break;
+  }
+
+  return pulls;
+}
+
+async function getOkToTestSkipReason(
+  pr: PullListItem,
+  ownersAliasesUsers: Set<string>,
+  token: string
+): Promise<string | null> {
+  if (hasLabel(pr.labels, 'ok-to-test')) {
+    return 'ok-to-test label already exists';
+  }
+
+  const authorLogin = pr.user?.login ? normalizeLogin(pr.user.login) : '';
+  if (!authorLogin) {
+    return 'PR author is missing';
+  }
+  if (!ownersAliasesUsers.has(authorLogin)) {
+    return `Author ${authorLogin} is not in OWNERS_ALIASES`;
+  }
+
+  if (await hasFastTestTiprowTriggered(pr.head.sha, token)) {
+    return `${BLOCKED_CHECK} already triggered`;
+  }
+
+  return null;
 }
 
 async function getTrackedPrNumbers(env: Env): Promise<number[]> {
@@ -127,10 +203,40 @@ type CommitStatusResponse = {
   statuses: Array<{ context: string; state: string }>;
 };
 
+type CommitCheckRunsResponse = {
+  check_runs: Array<{ name: string }>;
+};
+
+type RepoFileResponse = {
+  content: string;
+  encoding: string;
+};
+
+type IssueComment = {
+  body: string | null;
+};
+
 type CheckStateSummary = {
   failed: string[];
   hasPending: boolean;
 };
+
+function normalizeLogin(login: string): string {
+  return login.trim().replace(/^@/, '').toLowerCase();
+}
+
+function hasLabel(labels: PullLabel[], expected: string): boolean {
+  const normalizedExpected = expected.toLowerCase();
+  return labels.some((label) => label.name.toLowerCase() === normalizedExpected);
+}
+
+function includesFastTestTiprow(value: string): boolean {
+  return value.toLowerCase().includes(BLOCKED_CHECK);
+}
+
+function isOkToTestCommentBody(body: string | null): boolean {
+  return (body ?? '').trim() === '/ok-to-test';
+}
 
 async function getCheckStateSummary(sha: string, token: string): Promise<CheckStateSummary> {
   const data = await githubRequest<CommitStatusResponse>(
@@ -149,6 +255,82 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
   }
 
   return { failed, hasPending };
+}
+
+async function hasFastTestTiprowStatusContext(sha: string, token: string): Promise<boolean> {
+  const data = await githubRequest<CommitStatusResponse>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
+    token
+  );
+  return data.statuses.some((status) => includesFastTestTiprow(status.context));
+}
+
+async function hasFastTestTiprowCheckRun(sha: string, token: string): Promise<boolean> {
+  const data = await githubRequest<CommitCheckRunsResponse>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/check-runs?per_page=100`,
+    token
+  );
+  return data.check_runs.some((checkRun) => includesFastTestTiprow(checkRun.name));
+}
+
+async function hasFastTestTiprowTriggered(sha: string, token: string): Promise<boolean> {
+  if (await hasFastTestTiprowStatusContext(sha, token)) {
+    return true;
+  }
+  return await hasFastTestTiprowCheckRun(sha, token);
+}
+
+function decodeBase64Utf8(encoded: string): string {
+  const normalized = encoded.replace(/\s+/g, '');
+  const binary = atob(normalized);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function parseOwnersAliasesUsers(content: string): Set<string> {
+  const users = new Set<string>();
+  const lines = content.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('- ')) continue;
+    const withoutComment = trimmed.slice(2).split('#')[0]?.trim() ?? '';
+    if (!withoutComment) continue;
+    const withoutQuotes = withoutComment.replace(/^['"]|['"]$/g, '');
+    const login = normalizeLogin(withoutQuotes);
+    if (login) {
+      users.add(login);
+    }
+  }
+  return users;
+}
+
+async function getOwnersAliasesUsers(token: string): Promise<Set<string>> {
+  const response = await githubRequest<RepoFileResponse>(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/contents/OWNERS_ALIASES?ref=master`,
+    token
+  );
+  if (response.encoding !== 'base64') {
+    throw new Error(`Unexpected OWNERS_ALIASES encoding: ${response.encoding}`);
+  }
+  const content = decodeBase64Utf8(response.content);
+  return parseOwnersAliasesUsers(content);
+}
+
+async function hasOkToTestComment(prNumber: number, token: string): Promise<boolean> {
+  for (let page = 1; page <= 10; page += 1) {
+    const comments = await githubRequest<IssueComment[]>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      token
+    );
+    if (comments.some((comment) => isOkToTestCommentBody(comment.body))) {
+      return true;
+    }
+    if (comments.length < 100) {
+      break;
+    }
+  }
+
+  return false;
 }
 
 function classifyChecks(
@@ -188,6 +370,18 @@ async function postRetestComment(prNumber: number, token: string): Promise<void>
   );
 }
 
+async function postOkToTestComment(prNumber: number, token: string): Promise<void> {
+  await githubRequest(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments`,
+    token,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: '/ok-to-test' }),
+    }
+  );
+}
+
 async function getSetting(env: Env, key: string): Promise<string | null> {
   const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
   return row?.value ?? null;
@@ -212,6 +406,86 @@ async function ensureRetestStateHeadShaColumn(env: Env): Promise<void> {
   }
 
   retestStateHeadShaColumnEnsured = true;
+}
+
+async function ensureOkToTestStateTable(env: Env): Promise<void> {
+  if (okToTestStateTableEnsured) return;
+
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS ok_to_test_state (
+      pr_number INTEGER PRIMARY KEY,
+      last_seen_head_sha TEXT NULL,
+      last_action TEXT NULL,
+      last_action_at TEXT NULL,
+      last_error_message TEXT NULL,
+      last_status_log TEXT NULL
+    )`
+  ).run();
+
+  okToTestStateTableEnsured = true;
+}
+
+async function getOkToTestState(env: Env, prNumber: number): Promise<OkToTestStateRow | null> {
+  await ensureOkToTestStateTable(env);
+  const row = await env.DB.prepare(
+    'SELECT pr_number, last_seen_head_sha, last_action FROM ok_to_test_state WHERE pr_number = ?'
+  )
+    .bind(prNumber)
+    .first<OkToTestStateRow>();
+  return row ?? null;
+}
+
+async function upsertOkToTestState(
+  env: Env,
+  prNumber: number,
+  headSha: string,
+  action: 'commenting' | 'commented' | 'skipped' | 'error',
+  statusLog: string,
+  errorMessage: string | null
+): Promise<void> {
+  await ensureOkToTestStateTable(env);
+  await env.DB.prepare(
+    `INSERT INTO ok_to_test_state (pr_number, last_seen_head_sha, last_action, last_action_at, last_error_message, last_status_log)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET
+       last_seen_head_sha = excluded.last_seen_head_sha,
+       last_action = excluded.last_action,
+       last_action_at = excluded.last_action_at,
+       last_error_message = excluded.last_error_message,
+       last_status_log = excluded.last_status_log`
+  )
+    .bind(prNumber, headSha, action, nowIso(), errorMessage, statusLog)
+    .run();
+}
+
+async function tryClaimOkToTestComment(env: Env, prNumber: number, headSha: string): Promise<boolean> {
+  await ensureOkToTestStateTable(env);
+
+  const claimedAt = nowIso();
+  const staleThreshold = new Date(Date.now() - OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES * 60 * 1000).toISOString();
+  const result = await env.DB.prepare(
+    `INSERT INTO ok_to_test_state (pr_number, last_seen_head_sha, last_action, last_action_at, last_error_message, last_status_log)
+     VALUES (?, ?, 'commenting', ?, NULL, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET
+       last_seen_head_sha = excluded.last_seen_head_sha,
+       last_action = excluded.last_action,
+       last_action_at = excluded.last_action_at,
+       last_error_message = excluded.last_error_message,
+       last_status_log = excluded.last_status_log
+     WHERE ok_to_test_state.last_action IS NULL
+       OR ok_to_test_state.last_action = 'skipped'
+       OR ok_to_test_state.last_action = 'error'
+       OR (
+         ok_to_test_state.last_action = 'commenting'
+         AND ok_to_test_state.last_action_at IS NOT NULL
+         AND ok_to_test_state.last_action_at < ?
+       )`
+  )
+    .bind(prNumber, headSha, claimedAt, 'Acquired /ok-to-test comment claim', staleThreshold)
+    .run();
+
+  const changes = Number((result.meta as { changes?: number } | undefined)?.changes ?? 0);
+  return changes > 0;
 }
 
 async function upsertRetestState(
@@ -430,6 +704,91 @@ async function scanAndSchedule(env: Env): Promise<void> {
   }
 }
 
+async function scanAndAutoOkToTest(env: Env): Promise<void> {
+  const token = env.GITHUB_TOKEN;
+  const lookbackMinutes = parseNumber(
+    env.OK_TO_TEST_LOOKBACK_MINUTES,
+    DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES
+  );
+  const openMasterPrs = await listRecentOpenMasterPulls(token, lookbackMinutes);
+
+  if (openMasterPrs.length === 0) {
+    return;
+  }
+
+  const ownersAliasesUsers = await getOwnersAliasesUsers(token);
+  for (const pr of openMasterPrs) {
+    const previousState = await getOkToTestState(env, pr.number);
+    if (previousState?.last_action === 'commented') {
+      continue;
+    }
+
+    const skipReason = await getOkToTestSkipReason(pr, ownersAliasesUsers, token);
+    if (skipReason) {
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'skipped',
+        skipReason,
+        null
+      );
+      continue;
+    }
+
+    if (await hasOkToTestComment(pr.number, token)) {
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'commented',
+        'Detected existing /ok-to-test comment, skip posting',
+        null
+      );
+      continue;
+    }
+
+    const claimed = await tryClaimOkToTestComment(env, pr.number, pr.head.sha);
+    if (!claimed) {
+      continue;
+    }
+
+    if (await hasOkToTestComment(pr.number, token)) {
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'commented',
+        'Detected existing /ok-to-test comment after claim, skip posting',
+        null
+      );
+      continue;
+    }
+
+    try {
+      await postOkToTestComment(pr.number, token);
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'commented',
+        'Posted /ok-to-test because author is in OWNERS_ALIASES and fast_test_tiprow is not triggered',
+        null
+      );
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      await upsertOkToTestState(
+        env,
+        pr.number,
+        pr.head.sha,
+        'error',
+        'Failed to post /ok-to-test',
+        errorMessage
+      );
+    }
+  }
+}
+
 async function executeDueAttempts(env: Env): Promise<void> {
   const maxRetests = getMaxRetests(new Date(), env);
   const now = nowIso();
@@ -476,9 +835,8 @@ async function executeDueAttempts(env: Env): Promise<void> {
   }
 }
 
-async function shouldScan(env: Env): Promise<boolean> {
-  const intervalMinutes = parseNumber(env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
-  const lastScan = await getSetting(env, 'last_scan_at');
+async function shouldRunByLastScan(env: Env, settingKey: string, intervalMinutes: number): Promise<boolean> {
+  const lastScan = await getSetting(env, settingKey);
   if (!lastScan) return true;
 
   const lastMs = Date.parse(lastScan);
@@ -486,13 +844,31 @@ async function shouldScan(env: Env): Promise<boolean> {
   return Date.now() - lastMs >= intervalMinutes * 60 * 1000;
 }
 
+async function shouldScanRetest(env: Env): Promise<boolean> {
+  const intervalMinutes = parseNumber(env.SCAN_INTERVAL_MINUTES, DEFAULT_SCAN_INTERVAL_MINUTES);
+  return await shouldRunByLastScan(env, 'last_scan_at', intervalMinutes);
+}
+
+async function shouldScanOkToTest(env: Env): Promise<boolean> {
+  const intervalMinutes = parseNumber(
+    env.OK_TO_TEST_SCAN_INTERVAL_MINUTES,
+    DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES
+  );
+  return await shouldRunByLastScan(env, 'last_ok_to_test_scan_at', intervalMinutes);
+}
+
 async function handleCron(env: Env): Promise<void> {
-  if (await shouldScan(env)) {
+  if (await shouldScanRetest(env)) {
     await scanAndSchedule(env);
     await setSetting(env, 'last_scan_at', nowIso());
   }
 
   await executeDueAttempts(env);
+
+  if (await shouldScanOkToTest(env)) {
+    await scanAndAutoOkToTest(env);
+    await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
+  }
 }
 
 async function recordCronRun(env: Env, runId: string, patch: { status: string; errorMessage?: string | null }): Promise<void> {
