@@ -1,5 +1,13 @@
 # AGENTS
 
+## 2026-03-11 Prioritize Retry for `lgtm + approved` PRs
+
+Requirement:
+
+1. When multiple PRs are eligible for retry, prioritize PRs that have both:
+   - the `lgtm` label;
+   - the `approved` label.
+
 ## 2026-03-10 Retry Limit and UTC+8 Gate for High Attempts
 
 Requirement:

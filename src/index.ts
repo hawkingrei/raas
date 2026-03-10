@@ -209,9 +209,11 @@ type PullItem = {
   mergeable_state: string | null;
 };
 
-type PullDetail = PullItem;
-
 type PullLabel = { name: string };
+
+type PullDetail = PullItem & {
+  labels: PullLabel[];
+};
 
 type PullListItem = PullItem & {
   base: { ref: string };
@@ -492,6 +494,11 @@ async function postOkToTestComment(prNumber: number, token: string): Promise<voi
       body: JSON.stringify({ body: '/ok-to-test' }),
     }
   );
+}
+
+async function isPriorityRetryPr(token: string, prNumber: number): Promise<boolean> {
+  const pr = await getPullByNumber(token, prNumber);
+  return hasLabel(pr.labels, 'lgtm') && hasLabel(pr.labels, 'approved');
 }
 
 async function getSetting(env: Env, key: string): Promise<string | null> {
@@ -941,8 +948,40 @@ async function executeDueAttempts(env: Env): Promise<void> {
     .bind(now)
     .all<RetestAttemptRow>();
 
+  const attempts = rows.results || [];
+  if (attempts.length === 0) {
+    return;
+  }
+
+  const priorityEntries = await Promise.all(
+    Array.from(new Set(attempts.map((attempt) => attempt.pr_number))).map(async (prNumber) => {
+      try {
+        return [prNumber, await isPriorityRetryPr(env.GITHUB_TOKEN, prNumber)] as const;
+      } catch (error) {
+        console.error(`Failed to evaluate retry priority for PR #${prNumber}:`, error);
+        return [prNumber, false] as const;
+      }
+    })
+  );
+  const priorityMap = new Map<number, boolean>(priorityEntries);
+
+  attempts.sort((left, right) => {
+    const leftPriority = priorityMap.get(left.pr_number) ? 1 : 0;
+    const rightPriority = priorityMap.get(right.pr_number) ? 1 : 0;
+    if (leftPriority !== rightPriority) {
+      return rightPriority - leftPriority;
+    }
+
+    const scheduledCompare = Date.parse(left.scheduled_at) - Date.parse(right.scheduled_at);
+    if (scheduledCompare !== 0) {
+      return scheduledCompare;
+    }
+
+    return left.id - right.id;
+  });
+
   let executedAttempts = 0;
-  for (const attempt of rows.results || []) {
+  for (const attempt of attempts) {
     if (executedAttempts >= maxRetests) break;
 
     const state = await getRetestState(env, attempt.pr_number);
@@ -966,7 +1005,6 @@ async function executeDueAttempts(env: Env): Promise<void> {
         continue;
       }
     }
-
     let status = 'success';
     let errorMessage: string | null = null;
     try {
