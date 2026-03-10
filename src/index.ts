@@ -52,13 +52,19 @@ const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
-const BACKOFF_MINUTES = [0, 10, 20, 40, 360];
+const BACKOFF_MINUTES = [0, 10, 20, 40, 360] as const;
+const MAX_RETEST_ATTEMPTS = 8;
+const HIGH_ATTEMPT_THRESHOLD = BACKOFF_MINUTES.length;
+const HIGH_ATTEMPT_INTERVAL_MS = 60 * 60 * 1000;
+const LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING = 'last_high_attempt_executed_at';
+const UTC_PLUS_8_OFFSET_MS = 8 * 60 * 60 * 1000;
+const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
 const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const BLOCKED_CHECK = 'fast_test_tiprow';
-let retestStateHeadShaColumnEnsured = false;
+let retestStateColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
 
 function nowIso(): string {
@@ -80,9 +86,91 @@ function parseNumber(value: string | undefined, fallback: number): number {
 }
 
 function isNightInShanghai(now: Date): boolean {
-  const utcHour = now.getUTCHours();
-  const shanghaiHour = (utcHour + 8) % 24;
-  return shanghaiHour >= 18 || shanghaiHour < 9;
+  const utcPlus8 = new Date(now.getTime() + UTC_PLUS_8_OFFSET_MS);
+  const utcPlus8Hour = utcPlus8.getUTCHours();
+  return utcPlus8Hour >= 18 || utcPlus8Hour < 9;
+}
+
+function isInHighAttemptWindowUtcPlus8(now: Date): boolean {
+  const utcPlus8 = new Date(now.getTime() + UTC_PLUS_8_OFFSET_MS);
+  const utcPlus8Hour = utcPlus8.getUTCHours();
+  return utcPlus8Hour < HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8;
+}
+
+function getNextHighAttemptWindowStartUtcPlus8Iso(now: Date): string {
+  const utcPlus8 = new Date(now.getTime() + UTC_PLUS_8_OFFSET_MS);
+  const nextUtcPlus8WindowStartMs = Date.UTC(
+    utcPlus8.getUTCFullYear(),
+    utcPlus8.getUTCMonth(),
+    utcPlus8.getUTCDate() + 1,
+    0,
+    0,
+    0,
+    0
+  );
+  return new Date(nextUtcPlus8WindowStartMs - UTC_PLUS_8_OFFSET_MS).toISOString();
+}
+
+function getNextAllowedHighAttemptIso(
+  now: Date,
+  lastHighAttemptExecutedAt: string | null
+): string {
+  let candidateMs = now.getTime();
+  if (lastHighAttemptExecutedAt) {
+    const lastExecutedMs = Date.parse(lastHighAttemptExecutedAt);
+    if (Number.isFinite(lastExecutedMs)) {
+      candidateMs = Math.max(candidateMs, lastExecutedMs + HIGH_ATTEMPT_INTERVAL_MS);
+    }
+  }
+
+  const candidate = new Date(candidateMs);
+  if (isInHighAttemptWindowUtcPlus8(candidate)) {
+    return candidate.toISOString();
+  }
+
+  return getNextHighAttemptWindowStartUtcPlus8Iso(candidate);
+}
+
+function isHighAttemptIndex(attemptIndex: number): boolean {
+  return attemptIndex > HIGH_ATTEMPT_THRESHOLD;
+}
+
+function hasReachedMaxAttempts(attemptCount: number): boolean {
+  return attemptCount >= MAX_RETEST_ATTEMPTS;
+}
+
+function getScheduledAttemptInfo(
+  state: RetestStateRow,
+  now: Date,
+  immediate: boolean
+): { attemptIndex: number; scheduledAt: string; statusLog: string } | null {
+  if (hasReachedMaxAttempts(state.attempt_count)) {
+    return null;
+  }
+
+  const attemptIndex = state.attempt_count + 1;
+  if (!isHighAttemptIndex(attemptIndex)) {
+    const delayMinutes = immediate ? 0 : BACKOFF_MINUTES[state.attempt_count];
+    const scheduledAt = new Date(now.getTime() + delayMinutes * 60 * 1000).toISOString();
+    const statusLog = immediate ? 'Scheduled immediate retest' : `Scheduled retest at ${scheduledAt}`;
+    return { attemptIndex, scheduledAt, statusLog };
+  }
+
+  if (isInHighAttemptWindowUtcPlus8(now)) {
+    const scheduledAt = now.toISOString();
+    return {
+      attemptIndex,
+      scheduledAt,
+      statusLog: 'Scheduled high-attempt retest in UTC+8 00:00-08:00 window',
+    };
+  }
+
+  const scheduledAt = getNextHighAttemptWindowStartUtcPlus8Iso(now);
+  return {
+    attemptIndex,
+    scheduledAt,
+    statusLog: `Deferred high-attempt retest until next UTC+8 00:00 window at ${scheduledAt}`,
+  };
 }
 
 function getMaxRetests(now: Date, env: Env): number {
@@ -204,7 +292,7 @@ type CommitStatusResponse = {
 };
 
 type CommitCheckRunsResponse = {
-  check_runs: Array<{ name: string }>;
+  check_runs: Array<{ name: string; status: string; conclusion: string | null }>;
 };
 
 type RepoFileResponse = {
@@ -239,22 +327,46 @@ function isOkToTestCommentBody(body: string | null): boolean {
 }
 
 async function getCheckStateSummary(sha: string, token: string): Promise<CheckStateSummary> {
-  const data = await githubRequest<CommitStatusResponse>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
-    token
-  );
+  const [statusData, checkRunData] = await Promise.all([
+    githubRequest<CommitStatusResponse>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
+      token
+    ),
+    githubRequest<CommitCheckRunsResponse>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/check-runs?per_page=100`,
+      token
+    ),
+  ]);
 
-  const failed: string[] = [];
+  const failed = new Set<string>();
   let hasPending = false;
-  for (const status of data.statuses) {
+  for (const status of statusData.statuses) {
     if (status.state === 'failure' || status.state === 'error') {
-      failed.push(status.context);
+      failed.add(status.context);
     } else if (status.state === 'pending') {
       hasPending = true;
     }
   }
 
-  return { failed, hasPending };
+  for (const checkRun of checkRunData.check_runs) {
+    if (checkRun.status !== 'completed') {
+      hasPending = true;
+      continue;
+    }
+
+    if (
+      checkRun.conclusion === 'failure' ||
+      checkRun.conclusion === 'timed_out' ||
+      checkRun.conclusion === 'cancelled' ||
+      checkRun.conclusion === 'action_required' ||
+      checkRun.conclusion === 'startup_failure' ||
+      checkRun.conclusion === 'stale'
+    ) {
+      failed.add(checkRun.name);
+    }
+  }
+
+  return { failed: Array.from(failed), hasPending };
 }
 
 async function hasFastTestTiprowStatusContext(sha: string, token: string): Promise<boolean> {
@@ -344,11 +456,11 @@ function classifyChecks(
   if (failedChecks.some((name) => blacklist.has(name))) {
     return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
   }
-  if (failedChecks.length === 0 && !hasPending) {
-    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
+  if (hasPending) {
+    return { status: 'running', shouldRetest: false, log: 'Checks running or queued' };
   }
-  if (failedChecks.length === 0 && hasPending) {
-    return { status: 'running', shouldRetest: false, log: 'Checks pending' };
+  if (failedChecks.length === 0) {
+    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
   }
   return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
@@ -393,8 +505,8 @@ async function setSetting(env: Env, key: string, value: string): Promise<void> {
     .run();
 }
 
-async function ensureRetestStateHeadShaColumn(env: Env): Promise<void> {
-  if (retestStateHeadShaColumnEnsured) return;
+async function ensureRetestStateColumns(env: Env): Promise<void> {
+  if (retestStateColumnsEnsured) return;
 
   try {
     await env.DB.prepare('ALTER TABLE retest_state ADD COLUMN last_seen_head_sha TEXT NULL').run();
@@ -405,7 +517,7 @@ async function ensureRetestStateHeadShaColumn(env: Env): Promise<void> {
     }
   }
 
-  retestStateHeadShaColumnEnsured = true;
+  retestStateColumnsEnsured = true;
 }
 
 async function ensureOkToTestStateTable(env: Env): Promise<void> {
@@ -496,7 +608,7 @@ async function upsertRetestState(
   checkedAt: string,
   statusLog: string
 ): Promise<void> {
-  await ensureRetestStateHeadShaColumn(env);
+  await ensureRetestStateColumns(env);
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
     `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_status_log)
@@ -513,7 +625,7 @@ async function upsertRetestState(
 }
 
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
-  await ensureRetestStateHeadShaColumn(env);
+  await ensureRetestStateColumns(env);
   const row = await env.DB.prepare(
     `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
      FROM retest_state WHERE pr_number = ?`
@@ -590,59 +702,84 @@ async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAtte
   return row ?? null;
 }
 
-async function scheduleNextAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
-  if (attemptCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare(
-      'UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL, last_status_log = ? WHERE pr_number = ?'
-    )
-      .bind(nowIso(), 'Reached max attempts', prNumber)
-      .run();
-    return;
-  }
-
-  const delayMinutes = BACKOFF_MINUTES[attemptCount];
-  const scheduledAt = new Date(Date.now() + delayMinutes * 60 * 1000).toISOString();
-  const attemptIndex = attemptCount + 1;
-
+async function markRetestStateDisabled(env: Env, prNumber: number): Promise<void> {
   await env.DB.prepare(
-    'INSERT INTO retest_attempts (pr_number, attempt_index, scheduled_at, status) VALUES (?, ?, ?, ?)'
+    'UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL, last_status_log = ? WHERE pr_number = ?'
   )
-    .bind(prNumber, attemptIndex, scheduledAt, 'scheduled')
-    .run();
-
-  await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
-    .bind(scheduledAt, prNumber)
-    .run();
-  await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-    .bind(`Scheduled retest at ${scheduledAt}`, prNumber)
+    .bind(nowIso(), `Reached max attempts (${MAX_RETEST_ATTEMPTS})`, prNumber)
     .run();
 }
 
-async function scheduleImmediateAttempt(env: Env, prNumber: number, attemptCount: number): Promise<void> {
-  if (attemptCount >= BACKOFF_MINUTES.length) {
-    await env.DB.prepare(
-      'UPDATE retest_state SET disabled_at = ?, next_retest_at = NULL, last_status_log = ? WHERE pr_number = ?'
-    )
-      .bind(nowIso(), 'Reached max attempts', prNumber)
-      .run();
+async function enqueueRetestAttempt(
+  env: Env,
+  state: RetestStateRow,
+  immediate: boolean
+): Promise<void> {
+  const schedule = getScheduledAttemptInfo(state, new Date(), immediate);
+  if (!schedule) {
+    await markRetestStateDisabled(env, state.pr_number);
     return;
   }
-
-  const scheduledAt = nowIso();
-  const attemptIndex = attemptCount + 1;
 
   await env.DB.prepare(
     'INSERT INTO retest_attempts (pr_number, attempt_index, scheduled_at, status) VALUES (?, ?, ?, ?)'
   )
-    .bind(prNumber, attemptIndex, scheduledAt, 'scheduled')
+    .bind(state.pr_number, schedule.attemptIndex, schedule.scheduledAt, 'scheduled')
     .run();
 
-  await env.DB.prepare('UPDATE retest_state SET next_retest_at = ? WHERE pr_number = ?')
-    .bind(scheduledAt, prNumber)
+  await env.DB.prepare('UPDATE retest_state SET next_retest_at = ?, last_status_log = ? WHERE pr_number = ?')
+    .bind(schedule.scheduledAt, schedule.statusLog, state.pr_number)
     .run();
-  await env.DB.prepare('UPDATE retest_state SET last_status_log = ? WHERE pr_number = ?')
-    .bind('Scheduled immediate retest', prNumber)
-    .run();
+}
+
+async function scheduleNextAttempt(env: Env, state: RetestStateRow): Promise<void> {
+  if (hasReachedMaxAttempts(state.attempt_count)) {
+    await markRetestStateDisabled(env, state.pr_number);
+    return;
+  }
+
+  await enqueueRetestAttempt(env, state, false);
+}
+
+async function scheduleImmediateAttempt(env: Env, state: RetestStateRow): Promise<void> {
+  if (hasReachedMaxAttempts(state.attempt_count)) {
+    await markRetestStateDisabled(env, state.pr_number);
+    return;
+  }
+
+  await enqueueRetestAttempt(env, state, true);
+}
+
+async function rescheduleHighAttemptToNextUtcPlus8Midnight(
+  env: Env,
+  attempt: RetestAttemptRow,
+  prNumber: number
+): Promise<void> {
+  const scheduledAt = getNextHighAttemptWindowStartUtcPlus8Iso(new Date());
+  await rescheduleHighAttempt(
+    env,
+    attempt,
+    prNumber,
+    scheduledAt,
+    `Deferred high-attempt retest until next UTC+8 00:00 window at ${scheduledAt}`
+  );
+}
+
+async function rescheduleHighAttempt(
+  env: Env,
+  attempt: RetestAttemptRow,
+  prNumber: number,
+  scheduledAt: string,
+  statusLog: string
+): Promise<void> {
+  await env.DB.batch([
+    env.DB.prepare(
+      'UPDATE retest_attempts SET scheduled_at = ?, status = ? WHERE id = ?'
+    )
+      .bind(scheduledAt, 'scheduled', attempt.id),
+    env.DB.prepare('UPDATE retest_state SET next_retest_at = ?, last_status_log = ? WHERE pr_number = ?')
+      .bind(scheduledAt, statusLog, prNumber),
+  ]);
 }
 
 async function scanAndSchedule(env: Env): Promise<void> {
@@ -690,7 +827,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
     }
     const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
     if (!state) continue;
-    if (checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
+    if (checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
       await resetAttemptsIfRecovered(env, pr.number);
       continue;
     }
@@ -700,7 +837,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const pending = await getPendingAttempt(env, pr.number);
     if (pending) continue;
 
-    await scheduleNextAttempt(env, pr.number, state.attempt_count);
+    await scheduleNextAttempt(env, state);
   }
 }
 
@@ -790,21 +927,46 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
 }
 
 async function executeDueAttempts(env: Env): Promise<void> {
-  const maxRetests = getMaxRetests(new Date(), env);
-  const now = nowIso();
+  const nowDate = new Date();
+  const maxRetests = getMaxRetests(nowDate, env);
+  const now = nowDate.toISOString();
+  let lastHighAttemptExecutedAt = await getSetting(env, LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING);
 
   const rows = await env.DB.prepare(
     `SELECT id, pr_number, attempt_index, scheduled_at
      FROM retest_attempts
      WHERE executed_at IS NULL AND scheduled_at <= ?
-     ORDER BY scheduled_at ASC
-     LIMIT ?`
+     ORDER BY scheduled_at ASC`
   )
-    .bind(now, maxRetests)
+    .bind(now)
     .all<RetestAttemptRow>();
 
-  const attempts = rows.results || [];
-  for (const attempt of attempts) {
+  let executedAttempts = 0;
+  for (const attempt of rows.results || []) {
+    if (executedAttempts >= maxRetests) break;
+
+    const state = await getRetestState(env, attempt.pr_number);
+    if (!state) continue;
+
+    if (isHighAttemptIndex(attempt.attempt_index)) {
+      if (!isInHighAttemptWindowUtcPlus8(nowDate)) {
+        await rescheduleHighAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
+        continue;
+      }
+
+      const nextAllowedAt = getNextAllowedHighAttemptIso(nowDate, lastHighAttemptExecutedAt);
+      if (Date.parse(nextAllowedAt) > nowDate.getTime()) {
+        await rescheduleHighAttempt(
+          env,
+          attempt,
+          attempt.pr_number,
+          nextAllowedAt,
+          `Deferred high-attempt retest until hourly slot opens at ${nextAllowedAt}`
+        );
+        continue;
+      }
+    }
+
     let status = 'success';
     let errorMessage: string | null = null;
     try {
@@ -820,18 +982,28 @@ async function executeDueAttempts(env: Env): Promise<void> {
       .bind(now, status, errorMessage, attempt.id)
       .run();
 
-    const state = await getRetestState(env, attempt.pr_number);
-    if (!state) continue;
-
     const nextAttemptCount = state.attempt_count + 1;
-    const disable = nextAttemptCount >= BACKOFF_MINUTES.length;
+    const disable = nextAttemptCount >= MAX_RETEST_ATTEMPTS;
     const statusLog = status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`;
     await env.DB.prepare(
       'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ? WHERE pr_number = ?'
     )
-      .bind(nextAttemptCount, now, disable ? now : null, errorMessage, statusLog, attempt.pr_number)
+      .bind(
+        nextAttemptCount,
+        now,
+        disable ? now : null,
+        errorMessage,
+        statusLog,
+        attempt.pr_number
+      )
       .run();
 
+    if (isHighAttemptIndex(attempt.attempt_index)) {
+      await setSetting(env, LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING, now);
+      lastHighAttemptExecutedAt = now;
+    }
+
+    executedAttempts += 1;
   }
 }
 
@@ -947,7 +1119,7 @@ app.post('/track/:num', async (c) => {
 
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
     const state = await upsertStateAndResetIfHeadChanged(c.env, pr, failedChecks, checkResult);
-    if (state && checkResult.status === 'success' && state.attempt_count >= BACKOFF_MINUTES.length) {
+    if (state && checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
       await resetAttemptsIfRecovered(c.env, num);
       return c.json({ ok: true, pr_number: num, status: checkResult.status });
     }
@@ -956,7 +1128,7 @@ app.post('/track/:num', async (c) => {
       if (state && !state.disabled_at) {
         const pending = await getPendingAttempt(c.env, num);
         if (!pending) {
-          await scheduleImmediateAttempt(c.env, num, state.attempt_count);
+          await scheduleImmediateAttempt(c.env, state);
           await executeDueAttempts(c.env);
         }
       }
