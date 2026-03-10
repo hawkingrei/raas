@@ -292,7 +292,7 @@ type CommitStatusResponse = {
 };
 
 type CommitCheckRunsResponse = {
-  check_runs: Array<{ name: string }>;
+  check_runs: Array<{ name: string; status: string; conclusion: string | null }>;
 };
 
 type RepoFileResponse = {
@@ -327,22 +327,46 @@ function isOkToTestCommentBody(body: string | null): boolean {
 }
 
 async function getCheckStateSummary(sha: string, token: string): Promise<CheckStateSummary> {
-  const data = await githubRequest<CommitStatusResponse>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
-    token
-  );
+  const [statusData, checkRunData] = await Promise.all([
+    githubRequest<CommitStatusResponse>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
+      token
+    ),
+    githubRequest<CommitCheckRunsResponse>(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/check-runs?per_page=100`,
+      token
+    ),
+  ]);
 
-  const failed: string[] = [];
+  const failed = new Set<string>();
   let hasPending = false;
-  for (const status of data.statuses) {
+  for (const status of statusData.statuses) {
     if (status.state === 'failure' || status.state === 'error') {
-      failed.push(status.context);
+      failed.add(status.context);
     } else if (status.state === 'pending') {
       hasPending = true;
     }
   }
 
-  return { failed, hasPending };
+  for (const checkRun of checkRunData.check_runs) {
+    if (checkRun.status !== 'completed') {
+      hasPending = true;
+      continue;
+    }
+
+    if (
+      checkRun.conclusion === 'failure' ||
+      checkRun.conclusion === 'timed_out' ||
+      checkRun.conclusion === 'cancelled' ||
+      checkRun.conclusion === 'action_required' ||
+      checkRun.conclusion === 'startup_failure' ||
+      checkRun.conclusion === 'stale'
+    ) {
+      failed.add(checkRun.name);
+    }
+  }
+
+  return { failed: Array.from(failed), hasPending };
 }
 
 async function hasFastTestTiprowStatusContext(sha: string, token: string): Promise<boolean> {
@@ -432,11 +456,11 @@ function classifyChecks(
   if (failedChecks.some((name) => blacklist.has(name))) {
     return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
   }
-  if (failedChecks.length === 0 && !hasPending) {
-    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
+  if (hasPending) {
+    return { status: 'running', shouldRetest: false, log: 'Checks running or queued' };
   }
-  if (failedChecks.length === 0 && hasPending) {
-    return { status: 'running', shouldRetest: false, log: 'Checks pending' };
+  if (failedChecks.length === 0) {
+    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
   }
   return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
