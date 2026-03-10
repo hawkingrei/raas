@@ -1,5 +1,14 @@
 # AGENTS
 
+## 2026-03-10 Retry Limit and UTC+8 Gate for High Attempts
+
+Requirement:
+
+1. Increase the automatic retest ceiling from 5 to 8 total attempts.
+2. For PRs whose next retest would exceed 5:
+   - Only allow execution within the UTC+8 `00:00-08:00` window.
+   - Allow at most one `retry > 5` execution globally per hour.
+
 ## 2026-03-03 Auto `/ok-to-test` for Eligible Authors
 
 Requirement:
