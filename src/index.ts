@@ -308,7 +308,7 @@ type IssueComment = {
 
 type CheckStateSummary = {
   failed: string[];
-  hasPending: boolean;
+  pending: string[];
 };
 
 function normalizeLogin(login: string): string {
@@ -322,6 +322,10 @@ function hasLabel(labels: PullLabel[], expected: string): boolean {
 
 function includesFastTestTiprow(value: string): boolean {
   return value.toLowerCase().includes(BLOCKED_CHECK);
+}
+
+function isTideCheck(value: string): boolean {
+  return value.trim().toLowerCase() === 'tide';
 }
 
 function isOkToTestCommentBody(body: string | null): boolean {
@@ -341,18 +345,18 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
   ]);
 
   const failed = new Set<string>();
-  let hasPending = false;
+  const pending = new Set<string>();
   for (const status of statusData.statuses) {
     if (status.state === 'failure' || status.state === 'error') {
       failed.add(status.context);
     } else if (status.state === 'pending') {
-      hasPending = true;
+      pending.add(status.context);
     }
   }
 
   for (const checkRun of checkRunData.check_runs) {
     if (checkRun.status !== 'completed') {
-      hasPending = true;
+      pending.add(checkRun.name);
       continue;
     }
 
@@ -368,7 +372,7 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
     }
   }
 
-  return { failed: Array.from(failed), hasPending };
+  return { failed: Array.from(failed), pending: Array.from(pending) };
 }
 
 async function hasFastTestTiprowStatusContext(sha: string, token: string): Promise<boolean> {
@@ -449,7 +453,7 @@ async function hasOkToTestComment(prNumber: number, token: string): Promise<bool
 
 function classifyChecks(
   failedChecks: string[],
-  hasPending: boolean,
+  pendingChecks: string[],
   blacklist: Set<string>
 ): { status: CheckStatus; shouldRetest: boolean; log: string } {
   if (failedChecks.includes(BLOCKED_CHECK)) {
@@ -458,7 +462,7 @@ function classifyChecks(
   if (failedChecks.some((name) => blacklist.has(name))) {
     return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
   }
-  if (hasPending) {
+  if (pendingChecks.some((name) => !isTideCheck(name))) {
     return { status: 'running', shouldRetest: false, log: 'Checks running or queued' };
   }
   if (failedChecks.length === 0) {
@@ -830,7 +834,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
     } else {
       const summary = await getCheckStateSummary(pr.head.sha, token);
       failedChecks = summary.failed;
-      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+      checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
     }
     const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
     if (!state) continue;
@@ -1152,7 +1156,7 @@ app.post('/track/:num', async (c) => {
     } else {
       const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
       failedChecks = summary.failed;
-      checkResult = classifyChecks(summary.failed, summary.hasPending, blacklist);
+      checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
     }
 
     await c.env.DB.prepare('INSERT OR IGNORE INTO tracked_prs (pr_number) VALUES (?)').bind(num).run();
