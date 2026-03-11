@@ -1775,6 +1775,10 @@ app.get('/', async (c) => {
   return c.html(html);
 });
 
+export const __test__ = {
+  classifyChecks,
+};
+
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
