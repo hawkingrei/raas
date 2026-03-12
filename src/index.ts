@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
+import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
 
-type CheckStatus = 'ignored' | 'success' | 'failed' | 'running' | 'conflict';
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
 type RetestStateRow = {
@@ -64,7 +64,6 @@ const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
-const BLOCKED_CHECK = 'fast_test_tiprow';
 const RETEST_REQUESTED_LOG = 'Retest comment posted; waiting for CI status update';
 let retestStateColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
@@ -339,10 +338,6 @@ function includesFastTestTiprow(value: string): boolean {
   return value.toLowerCase().includes(BLOCKED_CHECK);
 }
 
-function isTideCheck(value: string): boolean {
-  return value.trim().toLowerCase() === 'tide';
-}
-
 function isOkToTestCommentBody(body: string | null): boolean {
   return (body ?? '').trim() === '/ok-to-test';
 }
@@ -464,26 +459,6 @@ async function hasOkToTestComment(prNumber: number, token: string): Promise<bool
   }
 
   return false;
-}
-
-function classifyChecks(
-  failedChecks: string[],
-  pendingChecks: string[],
-  blacklist: Set<string>
-): { status: CheckStatus; shouldRetest: boolean; log: string } {
-  if (failedChecks.includes(BLOCKED_CHECK)) {
-    return { status: 'ignored', shouldRetest: false, log: `Blocked check: ${BLOCKED_CHECK}` };
-  }
-  if (failedChecks.some((name) => blacklist.has(name))) {
-    return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
-  }
-  if (pendingChecks.some((name) => !isTideCheck(name))) {
-    return { status: 'running', shouldRetest: false, log: 'Checks running or queued' };
-  }
-  if (failedChecks.length === 0) {
-    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
-  }
-  return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
 
 function isMergeConflict(pr: PullItem): boolean {
@@ -646,14 +621,13 @@ async function upsertRetestState(
   await ensureRetestStateColumns(env);
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
-    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_error_message, last_status_log)
-     VALUES (?, 0, ?, ?, ?, ?, ?, NULL, ?)
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_status_log)
+     VALUES (?, 0, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
        last_seen_head_sha = excluded.last_seen_head_sha,
        last_failure_checks = excluded.last_failure_checks,
        last_check_status = excluded.last_check_status,
        last_check_at = excluded.last_check_at,
-       last_error_message = excluded.last_error_message,
        last_status_log = excluded.last_status_log`
   )
     .bind(pr.number, pr.updated_at, pr.head.sha, failedJson, status, checkedAt, statusLog)
@@ -727,17 +701,26 @@ async function resetAttemptsIfHeadChanged(
   );
 }
 
+async function clearRetestStateError(env: Env, prNumber: number): Promise<void> {
+  await env.DB.prepare('UPDATE retest_state SET last_error_message = NULL WHERE pr_number = ?')
+    .bind(prNumber)
+    .run();
+}
+
 async function upsertStateAndResetIfHeadChanged(
   env: Env,
   pr: PullItem,
   failedChecks: string[],
-  checkResult: { status: CheckStatus; shouldRetest: boolean; log: string }
+  checkResult: CheckDecision
 ): Promise<RetestStateRow | null> {
   const previousState = await getRetestState(env, pr.number);
   const previousHeadSha = previousState?.last_seen_head_sha;
   const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
 
   await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+  if (previousState?.last_check_status === 'unknown') {
+    await clearRetestStateError(env, pr.number);
+  }
   if (headChanged && previousHeadSha) {
     await resetAttemptsIfHeadChanged(env, pr.number, previousHeadSha, pr.head.sha);
   }
@@ -1230,7 +1213,7 @@ app.post('/track/:num', async (c) => {
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
     const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
-    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let checkResult: CheckDecision;
     let failedChecks: string[] = [];
     if (isMergeConflict(pr)) {
       checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
