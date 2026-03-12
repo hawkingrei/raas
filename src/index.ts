@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
+import { takeScanBatch } from './scan-batch';
 
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
@@ -37,6 +38,7 @@ export interface Env {
   CHECK_BLACKLIST: string;
   SCAN_LOOKBACK_HOURS?: string;
   SCAN_INTERVAL_MINUTES?: string;
+  SCAN_BATCH_SIZE?: string;
   OK_TO_TEST_LOOKBACK_MINUTES?: string;
   OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
   DAY_MAX_RETESTS?: string;
@@ -48,7 +50,8 @@ export interface Env {
 const app = new Hono<{ Bindings: Env }>();
 
 const DEFAULT_LOOKBACK_HOURS = 48;
-const DEFAULT_SCAN_INTERVAL_MINUTES = 10;
+const DEFAULT_SCAN_INTERVAL_MINUTES = 5;
+const DEFAULT_SCAN_BATCH_SIZE = 10;
 const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_DAY_MAX_RETESTS = 2;
@@ -62,6 +65,7 @@ const UTC_PLUS_8_OFFSET_MS = 8 * 60 * 60 * 1000;
 const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
 const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
+const RETEST_SCAN_CURSOR_SETTING = 'retest_scan_cursor';
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const RETEST_REQUESTED_LOG = 'Retest comment posted; waiting for CI status update';
@@ -322,6 +326,25 @@ async function getTrackedPrNumbers(env: Env): Promise<number[]> {
   const rows = await env.DB.prepare('SELECT pr_number FROM tracked_prs ORDER BY pr_number ASC')
     .all<{ pr_number: number }>();
   return (rows.results || []).map((row) => row.pr_number);
+}
+
+async function getTrackedPrScanBatch(
+  env: Env
+): Promise<{ totalTracked: number; batch: number[]; nextCursor: number }> {
+  const tracked = await getTrackedPrNumbers(env);
+  if (tracked.length === 0) {
+    return { totalTracked: 0, batch: [], nextCursor: 0 };
+  }
+
+  const batchSize = parseNumber(env.SCAN_BATCH_SIZE, DEFAULT_SCAN_BATCH_SIZE);
+  const cursor = parseNumber((await getSetting(env, RETEST_SCAN_CURSOR_SETTING)) ?? undefined, 0);
+  const selection = takeScanBatch(tracked, cursor, batchSize);
+
+  return {
+    totalTracked: tracked.length,
+    batch: selection.items,
+    nextCursor: selection.nextCursor,
+  };
 }
 
 type CommitStatusResponse = {
@@ -847,10 +870,20 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
   const lookbackHours = parseNumber(env.SCAN_LOOKBACK_HOURS, DEFAULT_LOOKBACK_HOURS);
   const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
 
-  const tracked = await getTrackedPrNumbers(env);
+  const { totalTracked, batch: tracked, nextCursor } = await getTrackedPrScanBatch(env);
   if (tracked.length === 0) {
     console.log('No tracked PRs, skipping scan.');
     return;
+  }
+
+  if (totalTracked > tracked.length) {
+    console.log({
+      level: 'info',
+      event: 'retest.scan.batch_selected',
+      run_id: runId,
+      total_tracked: totalTracked,
+      batch_size: tracked.length,
+    });
   }
 
   const cutoffMs = Date.now() - lookbackHours * 60 * 60 * 1000;
@@ -917,6 +950,8 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
       await upsertRetestStateScanError(env, pr.number, message);
     }
   }
+
+  await setSetting(env, RETEST_SCAN_CURSOR_SETTING, String(nextCursor));
 }
 
 async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
