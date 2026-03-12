@@ -7,6 +7,7 @@ type RetestStateRow = {
   pr_number: number;
   attempt_count: number;
   next_retest_at: string | null;
+  last_retest_at: string | null;
   disabled_at: string | null;
   last_failure_checks: string | null;
   last_seen_updated_at: string | null;
@@ -63,6 +64,7 @@ const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
+const RETEST_REQUESTED_LOG = 'Retest comment posted; waiting for CI status update';
 let retestStateColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
 
@@ -82,6 +84,40 @@ function parseNumber(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? (error.stack || error.message) : String(error);
+}
+
+function getErrorLogFields(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      error_name: error.name,
+      error_message: error.message,
+      error_stack: error.stack ?? null,
+    };
+  }
+
+  return { error_message: String(error) };
+}
+
+function logErrorEvent(event: string, error: unknown, fields: Record<string, unknown> = {}): void {
+  console.error({
+    level: 'error',
+    event,
+    ...fields,
+    ...getErrorLogFields(error),
+  });
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function isNightInShanghai(now: Date): boolean {
@@ -503,6 +539,15 @@ async function ensureRetestStateColumns(env: Env): Promise<void> {
     }
   }
 
+  try {
+    await env.DB.prepare('ALTER TABLE retest_state ADD COLUMN last_retest_at TEXT NULL').run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('duplicate column name: last_retest_at')) {
+      throw error;
+    }
+  }
+
   retestStateColumnsEnsured = true;
 }
 
@@ -610,10 +655,30 @@ async function upsertRetestState(
     .run();
 }
 
+async function upsertRetestStateScanError(
+  env: Env,
+  prNumber: number,
+  errorMessage: string
+): Promise<void> {
+  await ensureRetestStateColumns(env);
+  const checkedAt = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO retest_state (pr_number, attempt_count, last_check_status, last_check_at, last_error_message, last_status_log)
+     VALUES (?, 0, 'unknown', ?, ?, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET
+       last_check_status = excluded.last_check_status,
+       last_check_at = excluded.last_check_at,
+       last_error_message = excluded.last_error_message,
+       last_status_log = excluded.last_status_log`
+  )
+    .bind(prNumber, checkedAt, errorMessage, 'Failed to refresh PR state; will retry on next cron')
+    .run();
+}
+
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
   await ensureRetestStateColumns(env);
   const row = await env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
+    `SELECT pr_number, attempt_count, next_retest_at, last_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
      FROM retest_state WHERE pr_number = ?`
   )
     .bind(prNumber)
@@ -657,6 +722,12 @@ async function resetAttemptsIfHeadChanged(
   );
 }
 
+async function clearRetestStateError(env: Env, prNumber: number): Promise<void> {
+  await env.DB.prepare('UPDATE retest_state SET last_error_message = NULL WHERE pr_number = ?')
+    .bind(prNumber)
+    .run();
+}
+
 async function upsertStateAndResetIfHeadChanged(
   env: Env,
   pr: PullItem,
@@ -668,6 +739,9 @@ async function upsertStateAndResetIfHeadChanged(
   const headChanged = !!(previousHeadSha && previousHeadSha !== pr.head.sha);
 
   await upsertRetestState(env, pr, failedChecks, checkResult.status, nowIso(), checkResult.log);
+  if (previousState?.last_check_status === 'unknown') {
+    await clearRetestStateError(env, pr.number);
+  }
   if (headChanged && previousHeadSha) {
     await resetAttemptsIfHeadChanged(env, pr.number, previousHeadSha, pr.head.sha);
   }
@@ -768,7 +842,7 @@ async function rescheduleHighAttempt(
   ]);
 }
 
-async function scanAndSchedule(env: Env): Promise<void> {
+async function scanAndSchedule(env: Env, runId: string): Promise<void> {
   const token = env.GITHUB_TOKEN;
   const lookbackHours = parseNumber(env.SCAN_LOOKBACK_HOURS, DEFAULT_LOOKBACK_HOURS);
   const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
@@ -789,45 +863,63 @@ async function scanAndSchedule(env: Env): Promise<void> {
 
   for (const result of results) {
     if (result.status === 'rejected') {
-      console.error(`Failed to fetch PR #${result.prNumber}:`, result.reason);
+      logErrorEvent('retest.scan.fetch_pr_failed', result.reason, {
+        run_id: runId,
+        pr_number: result.prNumber,
+      });
+      await upsertRetestStateScanError(
+        env,
+        result.prNumber,
+        `Failed to fetch PR from GitHub: ${formatErrorMessage(result.reason)}`
+      );
       continue;
     }
     const pr = result.value;
 
-    if (pr.state !== 'open') {
-      await deleteTrackedPrData(env, result.prNumber);
-      continue;
+    try {
+      if (pr.state !== 'open') {
+        await deleteTrackedPrData(env, result.prNumber);
+        continue;
+      }
+
+      const updatedMs = Date.parse(pr.updated_at);
+      if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
+
+      let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+      let failedChecks: string[] = [];
+      if (isMergeConflict(pr)) {
+        checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+      } else {
+        const summary = await getCheckStateSummary(pr.head.sha, token);
+        failedChecks = summary.failed;
+        checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
+      }
+      const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
+      if (!state) continue;
+      if (checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
+        await resetAttemptsIfRecovered(env, pr.number);
+        continue;
+      }
+      if (!checkResult.shouldRetest) continue;
+      if (state.disabled_at) continue;
+
+      const pending = await getPendingAttempt(env, pr.number);
+      if (pending) continue;
+
+      await scheduleNextAttempt(env, state);
+    } catch (error) {
+      const message = formatErrorMessage(error);
+      logErrorEvent('retest.scan.pr_failed', error, {
+        run_id: runId,
+        pr_number: pr.number,
+        head_sha: pr.head.sha,
+      });
+      await upsertRetestStateScanError(env, pr.number, message);
     }
-
-    const updatedMs = Date.parse(pr.updated_at);
-    if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
-
-    let checkResult: CheckDecision;
-    let failedChecks: string[] = [];
-    if (isMergeConflict(pr)) {
-      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
-    } else {
-      const summary = await getCheckStateSummary(pr.head.sha, token);
-      failedChecks = summary.failed;
-      checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
-    }
-    const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
-    if (!state) continue;
-    if (checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
-      await resetAttemptsIfRecovered(env, pr.number);
-      continue;
-    }
-    if (!checkResult.shouldRetest) continue;
-    if (state.disabled_at) continue;
-
-    const pending = await getPendingAttempt(env, pr.number);
-    if (pending) continue;
-
-    await scheduleNextAttempt(env, state);
   }
 }
 
-async function scanAndAutoOkToTest(env: Env): Promise<void> {
+async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
   const token = env.GITHUB_TOKEN;
   const lookbackMinutes = parseNumber(
     env.OK_TO_TEST_LOOKBACK_MINUTES,
@@ -900,6 +992,11 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
       );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      logErrorEvent('ok_to_test.comment_failed', error, {
+        run_id: runId,
+        pr_number: pr.number,
+        head_sha: pr.head.sha,
+      });
       await upsertOkToTestState(
         env,
         pr.number,
@@ -912,7 +1009,7 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
   }
 }
 
-async function executeDueAttempts(env: Env): Promise<void> {
+async function executeDueAttempts(env: Env, runId: string): Promise<void> {
   const nowDate = new Date();
   const maxRetests = getMaxRetests(nowDate, env);
   const now = nowDate.toISOString();
@@ -937,7 +1034,10 @@ async function executeDueAttempts(env: Env): Promise<void> {
       try {
         return [prNumber, await isPriorityRetryPr(env.GITHUB_TOKEN, prNumber)] as const;
       } catch (error) {
-        console.error(`Failed to evaluate retry priority for PR #${prNumber}:`, error);
+        logErrorEvent('retest.execute.priority_check_failed', error, {
+          run_id: runId,
+          pr_number: prNumber,
+        });
         return [prNumber, false] as const;
       }
     })
@@ -991,6 +1091,13 @@ async function executeDueAttempts(env: Env): Promise<void> {
     } catch (error) {
       status = 'error';
       errorMessage = error instanceof Error ? error.message : String(error);
+      logErrorEvent('retest.execute.comment_failed', error, {
+        run_id: runId,
+        pr_number: attempt.pr_number,
+        attempt_id: attempt.id,
+        attempt_index: attempt.attempt_index,
+        scheduled_at: attempt.scheduled_at,
+      });
     }
 
     await env.DB.prepare(
@@ -1001,9 +1108,11 @@ async function executeDueAttempts(env: Env): Promise<void> {
 
     const nextAttemptCount = state.attempt_count + 1;
     const disable = nextAttemptCount >= MAX_RETEST_ATTEMPTS;
-    const statusLog = status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`;
+    const statusLog = status === 'success' ? RETEST_REQUESTED_LOG : `Retest failed: ${errorMessage ?? 'unknown'}`;
+    const nextCheckStatus = status === 'success' ? 'running' : state.last_check_status;
+    const nextCheckAt = status === 'success' ? now : state.last_check_at;
     await env.DB.prepare(
-      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ? WHERE pr_number = ?'
+      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ?, last_check_status = ?, last_check_at = ? WHERE pr_number = ?'
     )
       .bind(
         nextAttemptCount,
@@ -1011,6 +1120,8 @@ async function executeDueAttempts(env: Env): Promise<void> {
         disable ? now : null,
         errorMessage,
         statusLog,
+        nextCheckStatus,
+        nextCheckAt,
         attempt.pr_number
       )
       .run();
@@ -1046,17 +1157,47 @@ async function shouldScanOkToTest(env: Env): Promise<boolean> {
   return await shouldRunByLastScan(env, 'last_ok_to_test_scan_at', intervalMinutes);
 }
 
-async function handleCron(env: Env): Promise<void> {
+async function handleCron(env: Env, runId: string): Promise<void> {
+  const stageErrors: string[] = [];
+
   if (await shouldScanRetest(env)) {
-    await scanAndSchedule(env);
-    await setSetting(env, 'last_scan_at', nowIso());
+    try {
+      await scanAndSchedule(env, runId);
+      await setSetting(env, 'last_scan_at', nowIso());
+    } catch (error) {
+      logErrorEvent('cron.stage_failed', error, {
+        run_id: runId,
+        stage: 'retest_scan',
+      });
+      stageErrors.push(`retest scan failed: ${formatErrorMessage(error)}`);
+    }
   }
 
-  await executeDueAttempts(env);
+  try {
+    await executeDueAttempts(env, runId);
+  } catch (error) {
+    logErrorEvent('cron.stage_failed', error, {
+      run_id: runId,
+      stage: 'retest_execution',
+    });
+    stageErrors.push(`retest execution failed: ${formatErrorMessage(error)}`);
+  }
 
   if (await shouldScanOkToTest(env)) {
-    await scanAndAutoOkToTest(env);
-    await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
+    try {
+      await scanAndAutoOkToTest(env, runId);
+      await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
+    } catch (error) {
+      logErrorEvent('cron.stage_failed', error, {
+        run_id: runId,
+        stage: 'ok_to_test_scan',
+      });
+      stageErrors.push(`ok-to-test scan failed: ${formatErrorMessage(error)}`);
+    }
+  }
+
+  if (stageErrors.length > 0) {
+    throw new Error(stageErrors.join('\n\n'));
   }
 }
 
@@ -1070,17 +1211,24 @@ async function recordCronRun(env: Env, runId: string, patch: { status: string; e
 
 async function runCronWithMeta(event: ScheduledEvent, env: Env): Promise<void> {
   const runId = crypto.randomUUID();
+  const scheduledTimeMs = (event as unknown as { scheduledTime?: number }).scheduledTime ?? null;
+  const cron = (event as unknown as { cron?: string }).cron ?? null;
   await env.DB.prepare(
     'INSERT INTO cron_runs (run_id, scheduled_time_ms, cron, status) VALUES (?, ?, ?, ?)'
   )
-    .bind(runId, (event as unknown as { scheduledTime?: number }).scheduledTime ?? null, (event as unknown as { cron?: string }).cron ?? null, 'started')
+    .bind(runId, scheduledTimeMs, cron, 'started')
     .run();
 
   try {
-    await handleCron(env);
+    await handleCron(env, runId);
     await recordCronRun(env, runId, { status: 'success', errorMessage: null });
   } catch (error) {
-    const message = error instanceof Error ? (error.stack || error.message) : String(error);
+    const message = formatErrorMessage(error);
+    logErrorEvent('cron.run_failed', error, {
+      run_id: runId,
+      cron,
+      scheduled_time_ms: scheduledTimeMs,
+    });
     await recordCronRun(env, runId, { status: 'error', errorMessage: message });
   }
 }
@@ -1146,7 +1294,7 @@ app.post('/track/:num', async (c) => {
         const pending = await getPendingAttempt(c.env, num);
         if (!pending) {
           await scheduleImmediateAttempt(c.env, state);
-          await executeDueAttempts(c.env);
+          await executeDueAttempts(c.env, `manual-track-${num}-${crypto.randomUUID()}`);
         }
       }
     }
@@ -1171,6 +1319,7 @@ app.get('/prs', async (c) => {
     `SELECT t.pr_number,
             COALESCE(s.attempt_count, 0) AS attempt_count,
             s.next_retest_at,
+            s.last_retest_at,
             s.disabled_at,
             s.last_failure_checks,
             s.last_seen_updated_at,
@@ -1197,6 +1346,7 @@ app.get('/prs', async (c) => {
     pr_number: row.pr_number,
     attempt_count: row.attempt_count,
     next_retest_at: row.next_retest_at,
+    last_retest_at: row.last_retest_at,
     disabled_at: row.disabled_at,
     last_seen_updated_at: row.last_seen_updated_at,
     last_check_status: row.last_check_status,
@@ -1212,14 +1362,16 @@ app.get('/prs', async (c) => {
 app.get('/', async (c) => {
   let lastCronIso: string | null = null;
   let lastCronStatus: string | null = null;
+  let lastCronErrorMessage: string | null = null;
   let nextCronIso: string | null = null;
   let nextScanIso: string | null = null;
   const row = await c.env.DB.prepare(
-    'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
-  ).first<{ started_at: string; status: string }>();
+    'SELECT started_at, status, error_message FROM cron_runs ORDER BY started_at DESC LIMIT 1'
+  ).first<{ started_at: string; status: string; error_message: string | null }>();
   if (row) {
     lastCronIso = row.started_at;
     lastCronStatus = row.status;
+    lastCronErrorMessage = row.error_message;
     const lastMs = Date.parse(row.started_at);
     if (Number.isFinite(lastMs)) {
       const nextMs = lastMs + CRON_INTERVAL_MINUTES * 60 * 1000;
@@ -1246,6 +1398,9 @@ app.get('/', async (c) => {
   const nextScanSpan = nextScanIso
     ? `<span id="next-scan" class="ts" data-iso="${nextScanIso}"></span>`
     : '<span id="next-scan">Unknown</span>';
+  const cronErrorLine = lastCronStatus === 'error' && lastCronErrorMessage
+    ? `<div class="subtitle-line subtitle-error"><details><summary>Last cron error</summary><pre>${escapeHtml(lastCronErrorMessage)}</pre></details></div>`
+    : '';
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -1287,6 +1442,26 @@ app.get('/', async (c) => {
           display: flex;
           flex-wrap: wrap;
           gap: 10px;
+        }
+        .subtitle-error details {
+          width: 100%;
+          color: #fecaca;
+        }
+        .subtitle-error summary {
+          cursor: pointer;
+          font-weight: 600;
+        }
+        .subtitle-error pre {
+          margin: 8px 0 0;
+          padding: 12px;
+          white-space: pre-wrap;
+          word-break: break-word;
+          border-radius: 8px;
+          background: rgba(127, 29, 29, 0.35);
+          border: 1px solid rgba(248, 113, 113, 0.35);
+          color: #fee2e2;
+          font-size: 12px;
+          font-family: 'Consolas', 'Monaco', monospace;
         }
         .card {
           background: #ffffff;
@@ -1471,6 +1646,7 @@ app.get('/', async (c) => {
           <div class="subtitle-line">pingcap/tidb</div>
           <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
           <div class="subtitle-line">Next scan: ${nextScanSpan}</div>
+          ${cronErrorLine}
         </div>
 
         <div class="card add-section">
@@ -1541,7 +1717,7 @@ app.get('/', async (c) => {
             }
 
             listEl.innerHTML = '';
-            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log, failed_checks }) => {
+            prs.forEach(({ pr_number, attempt_count, next_retest_at, last_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log, failed_checks }) => {
               const li = document.createElement('li');
               li.className = 'pr-item';
 
@@ -1574,9 +1750,17 @@ app.get('/', async (c) => {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
                 nextBadge.dataset.iso = next_retest_at;
-                nextBadge.dataset.prefix = 'next check ';
-                nextBadge.textContent = 'next check ' + next_retest_at;
+                nextBadge.dataset.prefix = 'next retest ';
+                nextBadge.textContent = 'next retest ' + next_retest_at;
                 meta.appendChild(nextBadge);
+              }
+
+              if (last_retest_at) {
+                const lastRetest = document.createElement('span');
+                lastRetest.dataset.iso = last_retest_at;
+                lastRetest.dataset.prefix = 'retest requested · ';
+                lastRetest.textContent = 'retest requested ' + last_retest_at;
+                meta.appendChild(lastRetest);
               }
 
               if (disabled_at) {
@@ -1688,7 +1872,7 @@ app.get('/', async (c) => {
                 li.appendChild(errDiv);
               }
 
-              if (last_status_log && failed_checks && failed_checks.length > 0) {
+              if (last_status_log) {
                 const logDiv = document.createElement('div');
                 logDiv.className = 'failures';
                 const logTitle = document.createElement('div');
