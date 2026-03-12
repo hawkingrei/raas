@@ -7,6 +7,7 @@ type RetestStateRow = {
   pr_number: number;
   attempt_count: number;
   next_retest_at: string | null;
+  last_retest_at: string | null;
   disabled_at: string | null;
   last_failure_checks: string | null;
   last_seen_updated_at: string | null;
@@ -64,6 +65,7 @@ const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const BLOCKED_CHECK = 'fast_test_tiprow';
+const RETEST_REQUESTED_LOG = 'Retest comment posted; waiting for CI status update';
 let retestStateColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
 
@@ -83,6 +85,19 @@ function parseNumber(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? (error.stack || error.message) : String(error);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function isNightInShanghai(now: Date): boolean {
@@ -528,6 +543,15 @@ async function ensureRetestStateColumns(env: Env): Promise<void> {
     }
   }
 
+  try {
+    await env.DB.prepare('ALTER TABLE retest_state ADD COLUMN last_retest_at TEXT NULL').run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('duplicate column name: last_retest_at')) {
+      throw error;
+    }
+  }
+
   retestStateColumnsEnsured = true;
 }
 
@@ -622,23 +646,44 @@ async function upsertRetestState(
   await ensureRetestStateColumns(env);
   const failedJson = JSON.stringify(failedChecks);
   await env.DB.prepare(
-    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_status_log)
-     VALUES (?, 0, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO retest_state (pr_number, attempt_count, last_seen_updated_at, last_seen_head_sha, last_failure_checks, last_check_status, last_check_at, last_error_message, last_status_log)
+     VALUES (?, 0, ?, ?, ?, ?, ?, NULL, ?)
      ON CONFLICT(pr_number) DO UPDATE SET last_seen_updated_at = excluded.last_seen_updated_at,
        last_seen_head_sha = excluded.last_seen_head_sha,
        last_failure_checks = excluded.last_failure_checks,
        last_check_status = excluded.last_check_status,
        last_check_at = excluded.last_check_at,
+       last_error_message = excluded.last_error_message,
        last_status_log = excluded.last_status_log`
   )
     .bind(pr.number, pr.updated_at, pr.head.sha, failedJson, status, checkedAt, statusLog)
     .run();
 }
 
+async function upsertRetestStateScanError(
+  env: Env,
+  prNumber: number,
+  errorMessage: string
+): Promise<void> {
+  await ensureRetestStateColumns(env);
+  const checkedAt = nowIso();
+  await env.DB.prepare(
+    `INSERT INTO retest_state (pr_number, attempt_count, last_check_status, last_check_at, last_error_message, last_status_log)
+     VALUES (?, 0, 'unknown', ?, ?, ?)
+     ON CONFLICT(pr_number) DO UPDATE SET
+       last_check_status = excluded.last_check_status,
+       last_check_at = excluded.last_check_at,
+       last_error_message = excluded.last_error_message,
+       last_status_log = excluded.last_status_log`
+  )
+    .bind(prNumber, checkedAt, errorMessage, 'Failed to refresh PR state; will retry on next cron')
+    .run();
+}
+
 async function getRetestState(env: Env, prNumber: number): Promise<RetestStateRow | null> {
   await ensureRetestStateColumns(env);
   const row = await env.DB.prepare(
-    `SELECT pr_number, attempt_count, next_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
+    `SELECT pr_number, attempt_count, next_retest_at, last_retest_at, disabled_at, last_failure_checks, last_seen_updated_at, last_seen_head_sha, last_check_status, last_check_at, last_error_message, last_status_log
      FROM retest_state WHERE pr_number = ?`
   )
     .bind(prNumber)
@@ -815,40 +860,51 @@ async function scanAndSchedule(env: Env): Promise<void> {
   for (const result of results) {
     if (result.status === 'rejected') {
       console.error(`Failed to fetch PR #${result.prNumber}:`, result.reason);
+      await upsertRetestStateScanError(
+        env,
+        result.prNumber,
+        `Failed to fetch PR from GitHub: ${formatErrorMessage(result.reason)}`
+      );
       continue;
     }
     const pr = result.value;
 
-    if (pr.state !== 'open') {
-      await deleteTrackedPrData(env, result.prNumber);
-      continue;
+    try {
+      if (pr.state !== 'open') {
+        await deleteTrackedPrData(env, result.prNumber);
+        continue;
+      }
+
+      const updatedMs = Date.parse(pr.updated_at);
+      if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
+
+      let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+      let failedChecks: string[] = [];
+      if (isMergeConflict(pr)) {
+        checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+      } else {
+        const summary = await getCheckStateSummary(pr.head.sha, token);
+        failedChecks = summary.failed;
+        checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
+      }
+      const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
+      if (!state) continue;
+      if (checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
+        await resetAttemptsIfRecovered(env, pr.number);
+        continue;
+      }
+      if (!checkResult.shouldRetest) continue;
+      if (state.disabled_at) continue;
+
+      const pending = await getPendingAttempt(env, pr.number);
+      if (pending) continue;
+
+      await scheduleNextAttempt(env, state);
+    } catch (error) {
+      const message = formatErrorMessage(error);
+      console.error(`Failed to scan PR #${pr.number}:`, error);
+      await upsertRetestStateScanError(env, pr.number, message);
     }
-
-    const updatedMs = Date.parse(pr.updated_at);
-    if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
-
-    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
-    let failedChecks: string[] = [];
-    if (isMergeConflict(pr)) {
-      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
-    } else {
-      const summary = await getCheckStateSummary(pr.head.sha, token);
-      failedChecks = summary.failed;
-      checkResult = classifyChecks(summary.failed, summary.pending, blacklist);
-    }
-    const state = await upsertStateAndResetIfHeadChanged(env, pr, failedChecks, checkResult);
-    if (!state) continue;
-    if (checkResult.status === 'success' && state.attempt_count >= HIGH_ATTEMPT_THRESHOLD) {
-      await resetAttemptsIfRecovered(env, pr.number);
-      continue;
-    }
-    if (!checkResult.shouldRetest) continue;
-    if (state.disabled_at) continue;
-
-    const pending = await getPendingAttempt(env, pr.number);
-    if (pending) continue;
-
-    await scheduleNextAttempt(env, state);
   }
 }
 
@@ -1026,9 +1082,11 @@ async function executeDueAttempts(env: Env): Promise<void> {
 
     const nextAttemptCount = state.attempt_count + 1;
     const disable = nextAttemptCount >= MAX_RETEST_ATTEMPTS;
-    const statusLog = status === 'success' ? 'Retest comment posted' : `Retest failed: ${errorMessage ?? 'unknown'}`;
+    const statusLog = status === 'success' ? RETEST_REQUESTED_LOG : `Retest failed: ${errorMessage ?? 'unknown'}`;
+    const nextCheckStatus = status === 'success' ? 'running' : state.last_check_status;
+    const nextCheckAt = status === 'success' ? now : state.last_check_at;
     await env.DB.prepare(
-      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ? WHERE pr_number = ?'
+      'UPDATE retest_state SET attempt_count = ?, last_retest_at = ?, next_retest_at = NULL, disabled_at = ?, last_error_message = ?, last_status_log = ?, last_check_status = ?, last_check_at = ? WHERE pr_number = ?'
     )
       .bind(
         nextAttemptCount,
@@ -1036,6 +1094,8 @@ async function executeDueAttempts(env: Env): Promise<void> {
         disable ? now : null,
         errorMessage,
         statusLog,
+        nextCheckStatus,
+        nextCheckAt,
         attempt.pr_number
       )
       .run();
@@ -1072,16 +1132,37 @@ async function shouldScanOkToTest(env: Env): Promise<boolean> {
 }
 
 async function handleCron(env: Env): Promise<void> {
+  const stageErrors: string[] = [];
+
   if (await shouldScanRetest(env)) {
-    await scanAndSchedule(env);
-    await setSetting(env, 'last_scan_at', nowIso());
+    try {
+      await scanAndSchedule(env);
+      await setSetting(env, 'last_scan_at', nowIso());
+    } catch (error) {
+      console.error('Retest scan failed:', error);
+      stageErrors.push(`retest scan failed: ${formatErrorMessage(error)}`);
+    }
   }
 
-  await executeDueAttempts(env);
+  try {
+    await executeDueAttempts(env);
+  } catch (error) {
+    console.error('Retest execution failed:', error);
+    stageErrors.push(`retest execution failed: ${formatErrorMessage(error)}`);
+  }
 
   if (await shouldScanOkToTest(env)) {
-    await scanAndAutoOkToTest(env);
-    await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
+    try {
+      await scanAndAutoOkToTest(env);
+      await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
+    } catch (error) {
+      console.error('ok-to-test scan failed:', error);
+      stageErrors.push(`ok-to-test scan failed: ${formatErrorMessage(error)}`);
+    }
+  }
+
+  if (stageErrors.length > 0) {
+    throw new Error(stageErrors.join('\n\n'));
   }
 }
 
@@ -1105,7 +1186,7 @@ async function runCronWithMeta(event: ScheduledEvent, env: Env): Promise<void> {
     await handleCron(env);
     await recordCronRun(env, runId, { status: 'success', errorMessage: null });
   } catch (error) {
-    const message = error instanceof Error ? (error.stack || error.message) : String(error);
+    const message = formatErrorMessage(error);
     await recordCronRun(env, runId, { status: 'error', errorMessage: message });
   }
 }
@@ -1196,6 +1277,7 @@ app.get('/prs', async (c) => {
     `SELECT t.pr_number,
             COALESCE(s.attempt_count, 0) AS attempt_count,
             s.next_retest_at,
+            s.last_retest_at,
             s.disabled_at,
             s.last_failure_checks,
             s.last_seen_updated_at,
@@ -1222,6 +1304,7 @@ app.get('/prs', async (c) => {
     pr_number: row.pr_number,
     attempt_count: row.attempt_count,
     next_retest_at: row.next_retest_at,
+    last_retest_at: row.last_retest_at,
     disabled_at: row.disabled_at,
     last_seen_updated_at: row.last_seen_updated_at,
     last_check_status: row.last_check_status,
@@ -1237,14 +1320,16 @@ app.get('/prs', async (c) => {
 app.get('/', async (c) => {
   let lastCronIso: string | null = null;
   let lastCronStatus: string | null = null;
+  let lastCronErrorMessage: string | null = null;
   let nextCronIso: string | null = null;
   let nextScanIso: string | null = null;
   const row = await c.env.DB.prepare(
-    'SELECT started_at, status FROM cron_runs ORDER BY started_at DESC LIMIT 1'
-  ).first<{ started_at: string; status: string }>();
+    'SELECT started_at, status, error_message FROM cron_runs ORDER BY started_at DESC LIMIT 1'
+  ).first<{ started_at: string; status: string; error_message: string | null }>();
   if (row) {
     lastCronIso = row.started_at;
     lastCronStatus = row.status;
+    lastCronErrorMessage = row.error_message;
     const lastMs = Date.parse(row.started_at);
     if (Number.isFinite(lastMs)) {
       const nextMs = lastMs + CRON_INTERVAL_MINUTES * 60 * 1000;
@@ -1271,6 +1356,9 @@ app.get('/', async (c) => {
   const nextScanSpan = nextScanIso
     ? `<span id="next-scan" class="ts" data-iso="${nextScanIso}"></span>`
     : '<span id="next-scan">Unknown</span>';
+  const cronErrorLine = lastCronStatus === 'error' && lastCronErrorMessage
+    ? `<div class="subtitle-line subtitle-error"><details><summary>Last cron error</summary><pre>${escapeHtml(lastCronErrorMessage)}</pre></details></div>`
+    : '';
 
   const html = `<!DOCTYPE html>
   <html lang="en">
@@ -1312,6 +1400,26 @@ app.get('/', async (c) => {
           display: flex;
           flex-wrap: wrap;
           gap: 10px;
+        }
+        .subtitle-error details {
+          width: 100%;
+          color: #fecaca;
+        }
+        .subtitle-error summary {
+          cursor: pointer;
+          font-weight: 600;
+        }
+        .subtitle-error pre {
+          margin: 8px 0 0;
+          padding: 12px;
+          white-space: pre-wrap;
+          word-break: break-word;
+          border-radius: 8px;
+          background: rgba(127, 29, 29, 0.35);
+          border: 1px solid rgba(248, 113, 113, 0.35);
+          color: #fee2e2;
+          font-size: 12px;
+          font-family: 'Consolas', 'Monaco', monospace;
         }
         .card {
           background: #ffffff;
@@ -1496,6 +1604,7 @@ app.get('/', async (c) => {
           <div class="subtitle-line">pingcap/tidb</div>
           <div class="subtitle-line">Last cron: ${lastCronSpan} • Next cron: ${nextCronSpan}</div>
           <div class="subtitle-line">Next scan: ${nextScanSpan}</div>
+          ${cronErrorLine}
         </div>
 
         <div class="card add-section">
@@ -1566,7 +1675,7 @@ app.get('/', async (c) => {
             }
 
             listEl.innerHTML = '';
-            prs.forEach(({ pr_number, attempt_count, next_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log, failed_checks }) => {
+            prs.forEach(({ pr_number, attempt_count, next_retest_at, last_retest_at, disabled_at, last_seen_updated_at, last_check_status, last_check_at, last_error_message, last_status_log, failed_checks }) => {
               const li = document.createElement('li');
               li.className = 'pr-item';
 
@@ -1599,9 +1708,17 @@ app.get('/', async (c) => {
                 const nextBadge = document.createElement('span');
                 nextBadge.className = 'badge badge-next';
                 nextBadge.dataset.iso = next_retest_at;
-                nextBadge.dataset.prefix = 'next check ';
-                nextBadge.textContent = 'next check ' + next_retest_at;
+                nextBadge.dataset.prefix = 'next retest ';
+                nextBadge.textContent = 'next retest ' + next_retest_at;
                 meta.appendChild(nextBadge);
+              }
+
+              if (last_retest_at) {
+                const lastRetest = document.createElement('span');
+                lastRetest.dataset.iso = last_retest_at;
+                lastRetest.dataset.prefix = 'retest requested · ';
+                lastRetest.textContent = 'retest requested ' + last_retest_at;
+                meta.appendChild(lastRetest);
               }
 
               if (disabled_at) {
@@ -1713,7 +1830,7 @@ app.get('/', async (c) => {
                 li.appendChild(errDiv);
               }
 
-              if (last_status_log && failed_checks && failed_checks.length > 0) {
+              if (last_status_log) {
                 const logDiv = document.createElement('div');
                 logDiv.className = 'failures';
                 const logTitle = document.createElement('div');
