@@ -41,6 +41,7 @@ export interface Env {
   SCAN_BATCH_SIZE?: string;
   OK_TO_TEST_LOOKBACK_MINUTES?: string;
   OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
+  OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES?: string;
   DAY_MAX_RETESTS?: string;
   NIGHT_MAX_RETESTS?: string;
   TIMEZONE?: string;
@@ -54,6 +55,7 @@ const DEFAULT_SCAN_INTERVAL_MINUTES = 5;
 const DEFAULT_SCAN_BATCH_SIZE = 10;
 const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
+const DEFAULT_OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES = 60;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
 const BACKOFF_MINUTES = [0, 10, 20, 40, 360] as const;
@@ -260,6 +262,18 @@ type PullListItem = PullItem & {
   user: { login: string } | null;
 };
 
+type OkToTestCandidate = Pick<PullListItem, 'number' | 'state' | 'head' | 'base' | 'labels' | 'user'>;
+
+type PullRequestWebhookPayload = {
+  action?: string;
+  number?: number;
+  repository?: {
+    name?: string;
+    owner?: { login?: string };
+  };
+  pull_request?: OkToTestCandidate;
+};
+
 async function getPullByNumber(token: string, prNumber: number): Promise<PullDetail> {
   return await githubRequest<PullDetail>(
     `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
@@ -299,7 +313,7 @@ async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number)
 }
 
 async function getOkToTestSkipReason(
-  pr: PullListItem,
+  pr: OkToTestCandidate,
   ownersAliasesUsers: Set<string>,
   token: string
 ): Promise<string | null> {
@@ -320,6 +334,134 @@ async function getOkToTestSkipReason(
   }
 
   return null;
+}
+
+function shouldHandlePullRequestWebhookAction(action: string | undefined): boolean {
+  return action === 'opened' || action === 'reopened' || action === 'synchronize';
+}
+
+async function processOkToTestCandidate(
+  env: Env,
+  pr: OkToTestCandidate,
+  token: string,
+  ownersAliasesUsers: Set<string>,
+  runId: string,
+  source: 'cron' | 'webhook'
+): Promise<void> {
+  if (pr.state !== 'open' || pr.base.ref !== 'master') {
+    return;
+  }
+
+  const previousState = await getOkToTestState(env, pr.number);
+  if (previousState?.last_action === 'commented') {
+    return;
+  }
+
+  const skipReason = await getOkToTestSkipReason(pr, ownersAliasesUsers, token);
+  if (skipReason) {
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'skipped',
+      skipReason,
+      null
+    );
+    return;
+  }
+
+  if (await hasOkToTestComment(pr.number, token)) {
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'commented',
+      'Detected existing /ok-to-test comment, skip posting',
+      null
+    );
+    return;
+  }
+
+  const claimed = await tryClaimOkToTestComment(env, pr.number, pr.head.sha);
+  if (!claimed) {
+    return;
+  }
+
+  if (await hasOkToTestComment(pr.number, token)) {
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'commented',
+      'Detected existing /ok-to-test comment after claim, skip posting',
+      null
+    );
+    return;
+  }
+
+  try {
+    await postOkToTestComment(pr.number, token);
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'commented',
+      'Posted /ok-to-test because author is in OWNERS_ALIASES and fast_test_tiprow is not triggered',
+      null
+    );
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logErrorEvent('ok_to_test.comment_failed', error, {
+      run_id: runId,
+      source,
+      pr_number: pr.number,
+      head_sha: pr.head.sha,
+    });
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'error',
+      'Failed to post /ok-to-test',
+      errorMessage
+    );
+  }
+}
+
+async function handlePullRequestWebhook(
+  env: Env,
+  payload: PullRequestWebhookPayload,
+  deliveryId: string
+): Promise<void> {
+  const action = payload.action;
+  if (!shouldHandlePullRequestWebhookAction(action)) {
+    return;
+  }
+
+  const repoOwner = payload.repository?.owner?.login?.toLowerCase();
+  const repoName = payload.repository?.name?.toLowerCase();
+  if ((repoOwner && repoOwner !== REPO_OWNER) || (repoName && repoName !== REPO_NAME)) {
+    return;
+  }
+
+  const pr = payload.pull_request;
+  if (!pr) {
+    return;
+  }
+
+  const runId = `github-webhook-${deliveryId}`;
+  try {
+    const ownersAliasesUsers = await getOwnersAliasesUsers(env.GITHUB_TOKEN);
+    await processOkToTestCandidate(env, pr, env.GITHUB_TOKEN, ownersAliasesUsers, runId, 'webhook');
+  } catch (error) {
+    logErrorEvent('webhook.pull_request_failed', error, {
+      run_id: runId,
+      delivery_id: deliveryId,
+      action: action ?? 'unknown',
+      pr_number: pr.number,
+      head_sha: pr.head.sha,
+    });
+  }
 }
 
 async function getTrackedPrNumbers(env: Env): Promise<number[]> {
@@ -968,79 +1110,7 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
 
   const ownersAliasesUsers = await getOwnersAliasesUsers(token);
   for (const pr of openMasterPrs) {
-    const previousState = await getOkToTestState(env, pr.number);
-    if (previousState?.last_action === 'commented') {
-      continue;
-    }
-
-    const skipReason = await getOkToTestSkipReason(pr, ownersAliasesUsers, token);
-    if (skipReason) {
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'skipped',
-        skipReason,
-        null
-      );
-      continue;
-    }
-
-    if (await hasOkToTestComment(pr.number, token)) {
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'commented',
-        'Detected existing /ok-to-test comment, skip posting',
-        null
-      );
-      continue;
-    }
-
-    const claimed = await tryClaimOkToTestComment(env, pr.number, pr.head.sha);
-    if (!claimed) {
-      continue;
-    }
-
-    if (await hasOkToTestComment(pr.number, token)) {
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'commented',
-        'Detected existing /ok-to-test comment after claim, skip posting',
-        null
-      );
-      continue;
-    }
-
-    try {
-      await postOkToTestComment(pr.number, token);
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'commented',
-        'Posted /ok-to-test because author is in OWNERS_ALIASES and fast_test_tiprow is not triggered',
-        null
-      );
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      logErrorEvent('ok_to_test.comment_failed', error, {
-        run_id: runId,
-        pr_number: pr.number,
-        head_sha: pr.head.sha,
-      });
-      await upsertOkToTestState(
-        env,
-        pr.number,
-        pr.head.sha,
-        'error',
-        'Failed to post /ok-to-test',
-        errorMessage
-      );
-    }
+    await processOkToTestCandidate(env, pr, token, ownersAliasesUsers, runId, 'cron');
   }
 }
 
@@ -1185,10 +1255,15 @@ async function shouldScanRetest(env: Env): Promise<boolean> {
 }
 
 async function shouldScanOkToTest(env: Env): Promise<boolean> {
-  const intervalMinutes = parseNumber(
-    env.OK_TO_TEST_SCAN_INTERVAL_MINUTES,
-    DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES
-  );
+  const intervalMinutes = env.GITHUB_WEBHOOK_SECRET
+    ? parseNumber(
+      env.OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES,
+      DEFAULT_OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES
+    )
+    : parseNumber(
+      env.OK_TO_TEST_SCAN_INTERVAL_MINUTES,
+      DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES
+    );
   return await shouldRunByLastScan(env, 'last_ok_to_test_scan_at', intervalMinutes);
 }
 
@@ -1296,7 +1371,37 @@ async function verifyWebhookSignature(secret: string, body: ArrayBuffer, signatu
 }
 
 app.post('/webhook/github', async (c) => {
-  return c.json({ ok: true, disabled: true });
+  const secret = c.env.GITHUB_WEBHOOK_SECRET;
+  if (!secret) {
+    return c.json({ error: 'GITHUB_WEBHOOK_SECRET is not configured' }, 503);
+  }
+
+  const signature = c.req.header('X-Hub-Signature-256') ?? null;
+  const event = c.req.header('X-GitHub-Event') ?? 'unknown';
+  const deliveryId = c.req.header('X-GitHub-Delivery') ?? crypto.randomUUID();
+  const body = await c.req.raw.arrayBuffer();
+
+  if (!(await verifyWebhookSignature(secret, body, signature))) {
+    return c.json({ error: 'Invalid webhook signature' }, 401);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return c.json({ error: 'Invalid JSON payload' }, 400);
+  }
+
+  if (event === 'ping') {
+    return c.json({ ok: true, event, delivery_id: deliveryId });
+  }
+
+  if (event === 'pull_request') {
+    c.executionCtx.waitUntil(handlePullRequestWebhook(c.env, payload as PullRequestWebhookPayload, deliveryId));
+    return c.json({ ok: true, accepted: true, event, delivery_id: deliveryId });
+  }
+
+  return c.json({ ok: true, ignored: true, event, delivery_id: deliveryId });
 });
 
 
