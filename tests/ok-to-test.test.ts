@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { shouldEnqueueOkToTest, shouldRecheckCommentedState } from '../src/ok-to-test';
+import { shouldEnqueueOkToTest } from '../src/ok-to-test';
 
 test('does not enqueue the same head again while pending', () => {
   const result = shouldEnqueueOkToTest(
@@ -37,32 +37,6 @@ test('re-enqueues when head sha changes', () => {
       last_action_at: '2026-03-12T12:00:00.000Z',
     },
     'def456'
-  );
-
-  assert.equal(result, true);
-});
-
-test('skips commented state during the grace period', () => {
-  const result = shouldRecheckCommentedState(
-    {
-      last_action: 'commented',
-      last_action_at: '2026-03-12T12:00:00.000Z',
-    },
-    2 * 60 * 1000,
-    Date.parse('2026-03-12T12:01:00.000Z')
-  );
-
-  assert.equal(result, false);
-});
-
-test('rechecks commented state after the grace period', () => {
-  const result = shouldRecheckCommentedState(
-    {
-      last_action: 'commented',
-      last_action_at: '2026-03-12T12:00:00.000Z',
-    },
-    2 * 60 * 1000,
-    Date.parse('2026-03-12T12:03:00.000Z')
   );
 
   assert.equal(result, true);

@@ -20,24 +20,3 @@ export function shouldEnqueueOkToTest(
 
   return state.last_action === 'error';
 }
-
-export function shouldRecheckCommentedState(
-  state: Pick<OkToTestStateSnapshot, 'last_action' | 'last_action_at'>,
-  graceMs: number,
-  nowMs = Date.now()
-): boolean {
-  if (state.last_action !== 'commented') {
-    return true;
-  }
-
-  if (!state.last_action_at) {
-    return true;
-  }
-
-  const lastActionAtMs = Date.parse(state.last_action_at);
-  if (!Number.isFinite(lastActionAtMs)) {
-    return true;
-  }
-
-  return nowMs - lastActionAtMs >= graceMs;
-}

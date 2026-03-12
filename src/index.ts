@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
-import { shouldEnqueueOkToTest, shouldRecheckCommentedState, type OkToTestAction } from './ok-to-test';
+import { shouldEnqueueOkToTest, type OkToTestAction } from './ok-to-test';
 import { takeScanBatch } from './scan-batch';
 
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
@@ -32,6 +32,7 @@ type OkToTestStateRow = {
   last_seen_head_sha: string | null;
   last_action: OkToTestAction | null;
   last_action_at: string | null;
+  next_check_at: string | null;
 };
 
 export interface Env {
@@ -43,7 +44,8 @@ export interface Env {
   SCAN_BATCH_SIZE?: string;
   OK_TO_TEST_LOOKBACK_MINUTES?: string;
   OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
-  OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES?: string;
+  OK_TO_TEST_QUEUE_INTERVAL_MINUTES?: string;
+  OK_TO_TEST_FALLBACK_BATCH_SIZE?: string;
   DAY_MAX_RETESTS?: string;
   NIGHT_MAX_RETESTS?: string;
   TIMEZONE?: string;
@@ -57,7 +59,7 @@ const DEFAULT_SCAN_INTERVAL_MINUTES = 5;
 const DEFAULT_SCAN_BATCH_SIZE = 10;
 const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
-const DEFAULT_OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES = 60;
+const DEFAULT_OK_TO_TEST_QUEUE_INTERVAL_MINUTES = 1;
 const DEFAULT_OK_TO_TEST_FALLBACK_BATCH_SIZE = 20;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
@@ -68,8 +70,7 @@ const HIGH_ATTEMPT_INTERVAL_MS = 60 * 60 * 1000;
 const LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING = 'last_high_attempt_executed_at';
 const UTC_PLUS_8_OFFSET_MS = 8 * 60 * 60 * 1000;
 const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
-const OK_TO_TEST_WEBHOOK_DELAY_MS = 10 * 1000;
-const OK_TO_TEST_COMMENT_GRACE_MS = 2 * 60 * 1000;
+const OK_TO_TEST_INITIAL_DELAY_MS = 10 * 1000;
 const CRON_INTERVAL_MINUTES = 5;
 const RETEST_SCAN_CURSOR_SETTING = 'retest_scan_cursor';
 const REPO_OWNER = 'pingcap';
@@ -80,6 +81,10 @@ let okToTestStateTableEnsured = false;
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function delayedIso(delayMs: number): string {
+  return new Date(Date.now() + delayMs).toISOString();
 }
 
 function parseCsv(value: string | undefined): string[] {
@@ -94,6 +99,13 @@ function parseNumber(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getOkToTestQueueIntervalMs(env: Env): number {
+  return parseNumber(
+    env.OK_TO_TEST_QUEUE_INTERVAL_MINUTES,
+    DEFAULT_OK_TO_TEST_QUEUE_INTERVAL_MINUTES
+  ) * 60 * 1000;
 }
 
 function formatErrorMessage(error: unknown): string {
@@ -324,15 +336,12 @@ function shouldHandlePullRequestWebhookAction(action: string | undefined): boole
   return action === 'opened' || action === 'reopened' || action === 'synchronize';
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 async function enqueueOkToTestPending(
   env: Env,
   pr: OkToTestCandidate,
   source: 'cron' | 'webhook',
-  statusLog: string
+  statusLog: string,
+  delayMs: number
 ): Promise<boolean> {
   if (pr.state !== 'open' || pr.base.ref !== 'master') {
     await deleteOkToTestState(env, pr.number);
@@ -350,7 +359,8 @@ async function enqueueOkToTestPending(
     pr.head.sha,
     'pending',
     `${statusLog} (${source})`,
-    null
+    null,
+    delayedIso(delayMs)
   );
   return true;
 }
@@ -369,10 +379,6 @@ async function reconcileOkToTestState(
     return;
   }
 
-  if (!shouldRecheckCommentedState(state, OK_TO_TEST_COMMENT_GRACE_MS)) {
-    return;
-  }
-
   const pr = await getPullByNumber(token, prNumber);
   if (pr.state !== 'open' || pr.base.ref !== 'master') {
     await deleteOkToTestState(env, prNumber);
@@ -386,7 +392,8 @@ async function reconcileOkToTestState(
       pr.head.sha,
       'pending',
       'Detected newer head while reconciling /ok-to-test',
-      null
+      null,
+      delayedIso(OK_TO_TEST_INITIAL_DELAY_MS)
     );
     return;
   }
@@ -408,6 +415,15 @@ async function reconcileOkToTestState(
   }
 
   if (state.last_action === 'commented') {
+    await upsertOkToTestState(
+      env,
+      pr.number,
+      pr.head.sha,
+      'commented',
+      'Waiting for ok-to-test label propagation after posting /ok-to-test',
+      null,
+      delayedIso(getOkToTestQueueIntervalMs(env))
+    );
     return;
   }
 
@@ -419,7 +435,8 @@ async function reconcileOkToTestState(
       pr.head.sha,
       'commented',
       'Posted /ok-to-test and waiting for ok-to-test label propagation',
-      null
+      null,
+      delayedIso(getOkToTestQueueIntervalMs(env))
     );
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -435,7 +452,8 @@ async function reconcileOkToTestState(
       pr.head.sha,
       'error',
       'Failed to post /ok-to-test',
-      errorMessage
+      errorMessage,
+      delayedIso(getOkToTestQueueIntervalMs(env))
     );
   }
 }
@@ -463,26 +481,12 @@ async function handlePullRequestWebhook(
 
   const runId = `github-webhook-${deliveryId}`;
   try {
-    const queued = await enqueueOkToTestPending(
+    await enqueueOkToTestPending(
       env,
       pr,
       'webhook',
-      `Queued /ok-to-test webhook evaluation for ${action ?? 'unknown'}`
-    );
-    if (!queued) {
-      return;
-    }
-
-    await delay(OK_TO_TEST_WEBHOOK_DELAY_MS);
-    const ownersAliasesUsers = await getOwnersAliasesUsers(env.GITHUB_TOKEN);
-    await reconcileOkToTestState(
-      env,
-      pr.number,
-      pr.head.sha,
-      env.GITHUB_TOKEN,
-      ownersAliasesUsers,
-      runId,
-      'webhook'
+      `Queued /ok-to-test webhook evaluation for ${action ?? 'unknown'}`,
+      OK_TO_TEST_INITIAL_DELAY_MS
     );
   } catch (error) {
     logErrorEvent('webhook.pull_request_failed', error, {
@@ -498,7 +502,8 @@ async function handlePullRequestWebhook(
       pr.head.sha,
       'error',
       'Webhook-driven /ok-to-test processing failed',
-      formatErrorMessage(error)
+      formatErrorMessage(error),
+      delayedIso(getOkToTestQueueIntervalMs(env))
     );
   }
 }
@@ -739,10 +744,20 @@ async function ensureOkToTestStateTable(env: Env): Promise<void> {
       last_seen_head_sha TEXT NULL,
       last_action TEXT NULL,
       last_action_at TEXT NULL,
+      next_check_at TEXT NULL,
       last_error_message TEXT NULL,
       last_status_log TEXT NULL
     )`
   ).run();
+
+  try {
+    await env.DB.prepare('ALTER TABLE ok_to_test_state ADD COLUMN next_check_at TEXT NULL').run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('duplicate column name: next_check_at')) {
+      throw error;
+    }
+  }
 
   okToTestStateTableEnsured = true;
 }
@@ -750,30 +765,30 @@ async function ensureOkToTestStateTable(env: Env): Promise<void> {
 async function getOkToTestState(env: Env, prNumber: number): Promise<OkToTestStateRow | null> {
   await ensureOkToTestStateTable(env);
   const row = await env.DB.prepare(
-    'SELECT pr_number, last_seen_head_sha, last_action, last_action_at FROM ok_to_test_state WHERE pr_number = ?'
+    'SELECT pr_number, last_seen_head_sha, last_action, last_action_at, next_check_at FROM ok_to_test_state WHERE pr_number = ?'
   )
     .bind(prNumber)
     .first<OkToTestStateRow>();
   return row ?? null;
 }
 
-async function listPendingOkToTestStates(env: Env, limit: number): Promise<OkToTestStateRow[]> {
+async function listPendingOkToTestStates(
+  env: Env,
+  now: string,
+  limit: number
+): Promise<OkToTestStateRow[]> {
   await ensureOkToTestStateTable(env);
   const rows = await env.DB.prepare(
-    `SELECT pr_number, last_seen_head_sha, last_action, last_action_at
+    `SELECT pr_number, last_seen_head_sha, last_action, last_action_at, next_check_at
      FROM ok_to_test_state
      WHERE last_action IN ('pending', 'commented', 'error')
+       AND COALESCE(next_check_at, '') <= ?
      ORDER BY
-       CASE last_action
-         WHEN 'pending' THEN 0
-         WHEN 'error' THEN 1
-         ELSE 2
-       END,
-       COALESCE(last_action_at, '') ASC,
+       COALESCE(next_check_at, '') ASC,
        pr_number ASC
      LIMIT ?`
   )
-    .bind(limit)
+    .bind(now, limit)
     .all<OkToTestStateRow>();
   return rows.results || [];
 }
@@ -791,20 +806,22 @@ async function upsertOkToTestState(
   headSha: string,
   action: OkToTestAction,
   statusLog: string,
-  errorMessage: string | null
+  errorMessage: string | null,
+  nextCheckAt: string | null
 ): Promise<void> {
   await ensureOkToTestStateTable(env);
   await env.DB.prepare(
-    `INSERT INTO ok_to_test_state (pr_number, last_seen_head_sha, last_action, last_action_at, last_error_message, last_status_log)
-     VALUES (?, ?, ?, ?, ?, ?)
+    `INSERT INTO ok_to_test_state (pr_number, last_seen_head_sha, last_action, last_action_at, next_check_at, last_error_message, last_status_log)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(pr_number) DO UPDATE SET
        last_seen_head_sha = excluded.last_seen_head_sha,
        last_action = excluded.last_action,
        last_action_at = excluded.last_action_at,
+       next_check_at = excluded.next_check_at,
        last_error_message = excluded.last_error_message,
        last_status_log = excluded.last_status_log`
   )
-    .bind(prNumber, headSha, action, nowIso(), errorMessage, statusLog)
+    .bind(prNumber, headSha, action, nowIso(), nextCheckAt, errorMessage, statusLog)
     .run();
 }
 
@@ -1111,7 +1128,11 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
 async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
   const token = env.GITHUB_TOKEN;
   if (env.GITHUB_WEBHOOK_SECRET) {
-    const pendingStates = await listPendingOkToTestStates(env, DEFAULT_OK_TO_TEST_FALLBACK_BATCH_SIZE);
+    const fallbackBatchSize = parseNumber(
+      env.OK_TO_TEST_FALLBACK_BATCH_SIZE,
+      DEFAULT_OK_TO_TEST_FALLBACK_BATCH_SIZE
+    );
+    const pendingStates = await listPendingOkToTestStates(env, nowIso(), fallbackBatchSize);
     if (pendingStates.length === 0) {
       return;
     }
@@ -1152,7 +1173,8 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
           state.last_seen_head_sha,
           'error',
           'Cron fallback /ok-to-test processing failed',
-          formatErrorMessage(error)
+          formatErrorMessage(error),
+          delayedIso(getOkToTestQueueIntervalMs(env))
         );
       }
     }
@@ -1170,7 +1192,13 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
 
   const ownersAliasesUsers = await getOwnersAliasesUsers(token);
   for (const pr of openMasterPrs) {
-    const queued = await enqueueOkToTestPending(env, pr, 'cron', 'Queued cron /ok-to-test evaluation');
+    const queued = await enqueueOkToTestPending(
+      env,
+      pr,
+      'cron',
+      'Queued cron /ok-to-test evaluation',
+      0
+    );
     if (!queued) {
       continue;
     }
@@ -1196,7 +1224,8 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
         pr.head.sha,
         'error',
         'Cron /ok-to-test processing failed',
-        formatErrorMessage(error)
+        formatErrorMessage(error),
+        delayedIso(getOkToTestQueueIntervalMs(env))
       );
     }
   }
@@ -1343,15 +1372,14 @@ async function shouldScanRetest(env: Env): Promise<boolean> {
 }
 
 async function shouldScanOkToTest(env: Env): Promise<boolean> {
-  const intervalMinutes = env.GITHUB_WEBHOOK_SECRET
-    ? parseNumber(
-      env.OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES,
-      DEFAULT_OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES
-    )
-    : parseNumber(
-      env.OK_TO_TEST_SCAN_INTERVAL_MINUTES,
-      DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES
-    );
+  if (env.GITHUB_WEBHOOK_SECRET) {
+    return true;
+  }
+
+  const intervalMinutes = parseNumber(
+    env.OK_TO_TEST_SCAN_INTERVAL_MINUTES,
+    DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES
+  );
   return await shouldRunByLastScan(env, 'last_ok_to_test_scan_at', intervalMinutes);
 }
 
@@ -1485,7 +1513,7 @@ app.post('/webhook/github', async (c) => {
   }
 
   if (event === 'pull_request') {
-    c.executionCtx.waitUntil(handlePullRequestWebhook(c.env, payload as PullRequestWebhookPayload, deliveryId));
+    await handlePullRequestWebhook(c.env, payload as PullRequestWebhookPayload, deliveryId);
     return c.json({ ok: true, accepted: true, event, delivery_id: deliveryId });
   }
 
