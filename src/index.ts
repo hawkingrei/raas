@@ -90,6 +90,27 @@ function formatErrorMessage(error: unknown): string {
   return error instanceof Error ? (error.stack || error.message) : String(error);
 }
 
+function getErrorLogFields(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      error_name: error.name,
+      error_message: error.message,
+      error_stack: error.stack ?? null,
+    };
+  }
+
+  return { error_message: String(error) };
+}
+
+function logErrorEvent(event: string, error: unknown, fields: Record<string, unknown> = {}): void {
+  console.error({
+    level: 'error',
+    event,
+    ...fields,
+    ...getErrorLogFields(error),
+  });
+}
+
 function escapeHtml(value: string): string {
   return value
     .replaceAll('&', '&amp;')
@@ -821,7 +842,7 @@ async function rescheduleHighAttempt(
   ]);
 }
 
-async function scanAndSchedule(env: Env): Promise<void> {
+async function scanAndSchedule(env: Env, runId: string): Promise<void> {
   const token = env.GITHUB_TOKEN;
   const lookbackHours = parseNumber(env.SCAN_LOOKBACK_HOURS, DEFAULT_LOOKBACK_HOURS);
   const blacklist = new Set(parseCsv(env.CHECK_BLACKLIST));
@@ -842,7 +863,10 @@ async function scanAndSchedule(env: Env): Promise<void> {
 
   for (const result of results) {
     if (result.status === 'rejected') {
-      console.error(`Failed to fetch PR #${result.prNumber}:`, result.reason);
+      logErrorEvent('retest.scan.fetch_pr_failed', result.reason, {
+        run_id: runId,
+        pr_number: result.prNumber,
+      });
       await upsertRetestStateScanError(
         env,
         result.prNumber,
@@ -885,13 +909,17 @@ async function scanAndSchedule(env: Env): Promise<void> {
       await scheduleNextAttempt(env, state);
     } catch (error) {
       const message = formatErrorMessage(error);
-      console.error(`Failed to scan PR #${pr.number}:`, error);
+      logErrorEvent('retest.scan.pr_failed', error, {
+        run_id: runId,
+        pr_number: pr.number,
+        head_sha: pr.head.sha,
+      });
       await upsertRetestStateScanError(env, pr.number, message);
     }
   }
 }
 
-async function scanAndAutoOkToTest(env: Env): Promise<void> {
+async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
   const token = env.GITHUB_TOKEN;
   const lookbackMinutes = parseNumber(
     env.OK_TO_TEST_LOOKBACK_MINUTES,
@@ -964,6 +992,11 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
       );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+      logErrorEvent('ok_to_test.comment_failed', error, {
+        run_id: runId,
+        pr_number: pr.number,
+        head_sha: pr.head.sha,
+      });
       await upsertOkToTestState(
         env,
         pr.number,
@@ -976,7 +1009,7 @@ async function scanAndAutoOkToTest(env: Env): Promise<void> {
   }
 }
 
-async function executeDueAttempts(env: Env): Promise<void> {
+async function executeDueAttempts(env: Env, runId: string): Promise<void> {
   const nowDate = new Date();
   const maxRetests = getMaxRetests(nowDate, env);
   const now = nowDate.toISOString();
@@ -1001,7 +1034,10 @@ async function executeDueAttempts(env: Env): Promise<void> {
       try {
         return [prNumber, await isPriorityRetryPr(env.GITHUB_TOKEN, prNumber)] as const;
       } catch (error) {
-        console.error(`Failed to evaluate retry priority for PR #${prNumber}:`, error);
+        logErrorEvent('retest.execute.priority_check_failed', error, {
+          run_id: runId,
+          pr_number: prNumber,
+        });
         return [prNumber, false] as const;
       }
     })
@@ -1055,6 +1091,13 @@ async function executeDueAttempts(env: Env): Promise<void> {
     } catch (error) {
       status = 'error';
       errorMessage = error instanceof Error ? error.message : String(error);
+      logErrorEvent('retest.execute.comment_failed', error, {
+        run_id: runId,
+        pr_number: attempt.pr_number,
+        attempt_id: attempt.id,
+        attempt_index: attempt.attempt_index,
+        scheduled_at: attempt.scheduled_at,
+      });
     }
 
     await env.DB.prepare(
@@ -1114,32 +1157,41 @@ async function shouldScanOkToTest(env: Env): Promise<boolean> {
   return await shouldRunByLastScan(env, 'last_ok_to_test_scan_at', intervalMinutes);
 }
 
-async function handleCron(env: Env): Promise<void> {
+async function handleCron(env: Env, runId: string): Promise<void> {
   const stageErrors: string[] = [];
 
   if (await shouldScanRetest(env)) {
     try {
-      await scanAndSchedule(env);
+      await scanAndSchedule(env, runId);
       await setSetting(env, 'last_scan_at', nowIso());
     } catch (error) {
-      console.error('Retest scan failed:', error);
+      logErrorEvent('cron.stage_failed', error, {
+        run_id: runId,
+        stage: 'retest_scan',
+      });
       stageErrors.push(`retest scan failed: ${formatErrorMessage(error)}`);
     }
   }
 
   try {
-    await executeDueAttempts(env);
+    await executeDueAttempts(env, runId);
   } catch (error) {
-    console.error('Retest execution failed:', error);
+    logErrorEvent('cron.stage_failed', error, {
+      run_id: runId,
+      stage: 'retest_execution',
+    });
     stageErrors.push(`retest execution failed: ${formatErrorMessage(error)}`);
   }
 
   if (await shouldScanOkToTest(env)) {
     try {
-      await scanAndAutoOkToTest(env);
+      await scanAndAutoOkToTest(env, runId);
       await setSetting(env, 'last_ok_to_test_scan_at', nowIso());
     } catch (error) {
-      console.error('ok-to-test scan failed:', error);
+      logErrorEvent('cron.stage_failed', error, {
+        run_id: runId,
+        stage: 'ok_to_test_scan',
+      });
       stageErrors.push(`ok-to-test scan failed: ${formatErrorMessage(error)}`);
     }
   }
@@ -1159,17 +1211,24 @@ async function recordCronRun(env: Env, runId: string, patch: { status: string; e
 
 async function runCronWithMeta(event: ScheduledEvent, env: Env): Promise<void> {
   const runId = crypto.randomUUID();
+  const scheduledTimeMs = (event as unknown as { scheduledTime?: number }).scheduledTime ?? null;
+  const cron = (event as unknown as { cron?: string }).cron ?? null;
   await env.DB.prepare(
     'INSERT INTO cron_runs (run_id, scheduled_time_ms, cron, status) VALUES (?, ?, ?, ?)'
   )
-    .bind(runId, (event as unknown as { scheduledTime?: number }).scheduledTime ?? null, (event as unknown as { cron?: string }).cron ?? null, 'started')
+    .bind(runId, scheduledTimeMs, cron, 'started')
     .run();
 
   try {
-    await handleCron(env);
+    await handleCron(env, runId);
     await recordCronRun(env, runId, { status: 'success', errorMessage: null });
   } catch (error) {
     const message = formatErrorMessage(error);
+    logErrorEvent('cron.run_failed', error, {
+      run_id: runId,
+      cron,
+      scheduled_time_ms: scheduledTimeMs,
+    });
     await recordCronRun(env, runId, { status: 'error', errorMessage: message });
   }
 }
@@ -1235,7 +1294,7 @@ app.post('/track/:num', async (c) => {
         const pending = await getPendingAttempt(c.env, num);
         if (!pending) {
           await scheduleImmediateAttempt(c.env, state);
-          await executeDueAttempts(c.env);
+          await executeDueAttempts(c.env, `manual-track-${num}-${crypto.randomUUID()}`);
         }
       }
     }
