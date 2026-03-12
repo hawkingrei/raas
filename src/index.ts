@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
+import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
 
-type CheckStatus = 'ignored' | 'success' | 'failed' | 'running' | 'conflict';
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
 
 type RetestStateRow = {
@@ -63,7 +63,6 @@ const OK_TO_TEST_COMMENT_CLAIM_TTL_MINUTES = 15;
 const CRON_INTERVAL_MINUTES = 5;
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
-const BLOCKED_CHECK = 'fast_test_tiprow';
 let retestStateColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
 
@@ -324,10 +323,6 @@ function includesFastTestTiprow(value: string): boolean {
   return value.toLowerCase().includes(BLOCKED_CHECK);
 }
 
-function isTideCheck(value: string): boolean {
-  return value.trim().toLowerCase() === 'tide';
-}
-
 function isOkToTestCommentBody(body: string | null): boolean {
   return (body ?? '').trim() === '/ok-to-test';
 }
@@ -449,26 +444,6 @@ async function hasOkToTestComment(prNumber: number, token: string): Promise<bool
   }
 
   return false;
-}
-
-function classifyChecks(
-  failedChecks: string[],
-  pendingChecks: string[],
-  blacklist: Set<string>
-): { status: CheckStatus; shouldRetest: boolean; log: string } {
-  if (failedChecks.includes(BLOCKED_CHECK)) {
-    return { status: 'ignored', shouldRetest: false, log: `Blocked check: ${BLOCKED_CHECK}` };
-  }
-  if (failedChecks.some((name) => blacklist.has(name))) {
-    return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
-  }
-  if (pendingChecks.some((name) => !isTideCheck(name))) {
-    return { status: 'running', shouldRetest: false, log: 'Checks running or queued' };
-  }
-  if (failedChecks.length === 0) {
-    return { status: 'success', shouldRetest: false, log: 'No failed checks' };
-  }
-  return { status: 'failed', shouldRetest: true, log: 'Failed checks detected' };
 }
 
 function isMergeConflict(pr: PullItem): boolean {
@@ -686,7 +661,7 @@ async function upsertStateAndResetIfHeadChanged(
   env: Env,
   pr: PullItem,
   failedChecks: string[],
-  checkResult: { status: CheckStatus; shouldRetest: boolean; log: string }
+  checkResult: CheckDecision
 ): Promise<RetestStateRow | null> {
   const previousState = await getRetestState(env, pr.number);
   const previousHeadSha = previousState?.last_seen_head_sha;
@@ -827,7 +802,7 @@ async function scanAndSchedule(env: Env): Promise<void> {
     const updatedMs = Date.parse(pr.updated_at);
     if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
 
-    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let checkResult: CheckDecision;
     let failedChecks: string[] = [];
     if (isMergeConflict(pr)) {
       checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
@@ -1149,7 +1124,7 @@ app.post('/track/:num', async (c) => {
   try {
     const pr = await getPullByNumber(c.env.GITHUB_TOKEN, num);
     const blacklist = new Set(parseCsv(c.env.CHECK_BLACKLIST));
-    let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+    let checkResult: CheckDecision;
     let failedChecks: string[] = [];
     if (isMergeConflict(pr)) {
       checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
