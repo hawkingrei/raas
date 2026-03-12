@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS ok_to_test_state (
   last_seen_head_sha TEXT NULL,
   last_action TEXT NULL,
   last_action_at TEXT NULL,
+  next_check_at TEXT NULL,
   last_error_message TEXT NULL,
   last_status_log TEXT NULL
 );

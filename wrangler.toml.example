@@ -7,7 +7,7 @@ enabled = true
 head_sampling_rate = 1
 
 [triggers]
-crons = ["*/5 * * * *"]
+crons = ["* * * * *"]
 
 [[d1_databases]]
 binding = "DB"
@@ -24,7 +24,8 @@ SCAN_INTERVAL_MINUTES = "5"
 SCAN_BATCH_SIZE = "10"
 OK_TO_TEST_LOOKBACK_MINUTES = "10"
 OK_TO_TEST_SCAN_INTERVAL_MINUTES = "10"
-OK_TO_TEST_FALLBACK_SCAN_INTERVAL_MINUTES = "60"
+OK_TO_TEST_QUEUE_INTERVAL_MINUTES = "1"
+OK_TO_TEST_FALLBACK_BATCH_SIZE = "20"
 
 # Concurrency per scan window (Asia/Shanghai)
 DAY_MAX_RETESTS = "2"
