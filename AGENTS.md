@@ -1,5 +1,12 @@
 # AGENTS
 
+## 2026-03-25 Retest Gate for `fast_test_tiprow` and `unit-test`
+
+Requirement:
+
+1. `fast_test_tiprow` and `idc-jenkins-ci-tidb/unit-test` should block automatic retest only when both fail in the same scan.
+2. If either one fails alone, automatic retest is still allowed, subject to the existing pending-check, blacklist, backoff, and rate-limit rules.
+
 ## 2026-03-11 Prioritize Retry for `lgtm + approved` PRs
 
 Requirement:
