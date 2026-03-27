@@ -1,6 +1,12 @@
 import { Hono } from 'hono';
 import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
-import { shouldEnqueueOkToTest, type OkToTestAction } from './ok-to-test';
+import {
+  getOkToTestSkipReason,
+  hasRequiredOkToTestLabels,
+  isWithinOkToTestWindowUtcPlus8,
+  shouldEnqueueOkToTest,
+  type OkToTestAction,
+} from './ok-to-test';
 import { takeScanBatch } from './scan-batch';
 
 type CheckStatusWithUnknown = CheckStatus | 'unknown';
@@ -42,7 +48,6 @@ export interface Env {
   SCAN_LOOKBACK_HOURS?: string;
   SCAN_INTERVAL_MINUTES?: string;
   SCAN_BATCH_SIZE?: string;
-  OK_TO_TEST_LOOKBACK_MINUTES?: string;
   OK_TO_TEST_SCAN_INTERVAL_MINUTES?: string;
   OK_TO_TEST_QUEUE_INTERVAL_MINUTES?: string;
   OK_TO_TEST_FALLBACK_BATCH_SIZE?: string;
@@ -57,7 +62,6 @@ const app = new Hono<{ Bindings: Env }>();
 const DEFAULT_LOOKBACK_HOURS = 48;
 const DEFAULT_SCAN_INTERVAL_MINUTES = 5;
 const DEFAULT_SCAN_BATCH_SIZE = 10;
-const DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_SCAN_INTERVAL_MINUTES = 10;
 const DEFAULT_OK_TO_TEST_QUEUE_INTERVAL_MINUTES = 1;
 const DEFAULT_OK_TO_TEST_FALLBACK_BATCH_SIZE = 20;
@@ -282,11 +286,17 @@ type PullListItem = PullItem & {
   user: PullUser;
 };
 
-type OkToTestCandidate = Pick<PullListItem, 'number' | 'state' | 'head' | 'base' | 'labels' | 'user'>;
+type OkToTestCandidate = Pick<
+  PullListItem,
+  'number' | 'state' | 'head' | 'base' | 'labels' | 'user' | 'mergeable_state'
+>;
 
 type PullRequestWebhookPayload = {
   action?: string;
   number?: number;
+  label?: {
+    name?: string;
+  };
   repository?: {
     name?: string;
     owner?: { login?: string };
@@ -301,39 +311,63 @@ async function getPullByNumber(token: string, prNumber: number): Promise<PullDet
   );
 }
 
-async function listOpenMasterPulls(token: string, page: number): Promise<PullListItem[]> {
-  return await githubRequest<PullListItem[]>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&base=master&sort=created&direction=desc&per_page=100&page=${page}`,
-    token
-  );
-}
+type SearchIssuesResponse = {
+  items: Array<{ number: number }>;
+};
 
-async function listRecentOpenMasterPulls(token: string, lookbackMinutes: number): Promise<PullListItem[]> {
-  const cutoffMs = Date.now() - lookbackMinutes * 60 * 1000;
+async function listOpenMasterPullsWithRequiredLabels(token: string): Promise<PullListItem[]> {
+  const query = `repo:${REPO_OWNER}/${REPO_NAME} is:pr is:open base:master label:lgtm label:approved`;
   const pulls: PullListItem[] = [];
+  const seen = new Set<number>();
 
   for (let page = 1; page <= 10; page += 1) {
-    const items = await listOpenMasterPulls(token, page);
+    const searchResult = await githubRequest<SearchIssuesResponse>(
+      `/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=100&page=${page}`,
+      token
+    );
+    const items = searchResult.items;
     if (items.length === 0) break;
 
-    let reachedOlder = false;
-    for (const pr of items) {
-      const createdMs = Date.parse(pr.created_at);
-      if (!Number.isFinite(createdMs) || createdMs < cutoffMs) {
-        reachedOlder = true;
-        break;
+    const prs = await Promise.all(items.map((item) => getPullByNumber(token, item.number)));
+    for (const pr of prs) {
+      if (
+        hasRequiredOkToTestLabels(pr.labels.map((label) => label.name)) &&
+        !seen.has(pr.number)
+      ) {
+        seen.add(pr.number);
+        pulls.push(pr);
       }
-      pulls.push(pr);
     }
 
-    if (items.length < 100 || reachedOlder) break;
+    if (items.length < 100) break;
   }
 
   return pulls;
 }
 
-function shouldHandlePullRequestWebhookAction(action: string | undefined): boolean {
+function shouldHandlePullRequestWebhookAction(
+  action: string | undefined,
+  labelName: string | undefined
+): boolean {
+  if (action === 'labeled') {
+    if (!labelName) return false;
+    const normalizedLabel = labelName.toLowerCase();
+    return normalizedLabel === 'lgtm' || normalizedLabel === 'approved' || normalizedLabel === 'ok-to-test';
+  }
+
   return action === 'opened' || action === 'reopened' || action === 'synchronize';
+}
+
+async function isMergeConflictForOkToTestCandidate(
+  pr: OkToTestCandidate,
+  token: string
+): Promise<boolean> {
+  if (pr.mergeable_state === 'dirty' || pr.mergeable_state === 'clean') {
+    return pr.mergeable_state === 'dirty';
+  }
+
+  const detail = await getPullByNumber(token, pr.number);
+  return isMergeConflict(detail);
 }
 
 async function enqueueOkToTestPending(
@@ -370,7 +404,6 @@ async function reconcileOkToTestState(
   prNumber: number,
   expectedHeadSha: string,
   token: string,
-  ownersAliasesUsers: Set<string>,
   runId: string,
   source: 'cron' | 'webhook'
 ): Promise<void> {
@@ -403,13 +436,15 @@ async function reconcileOkToTestState(
     return;
   }
 
-  const authorLogin = pr.user?.login ? normalizeLogin(pr.user.login) : '';
-  if (!authorLogin || !ownersAliasesUsers.has(authorLogin)) {
-    await deleteOkToTestState(env, prNumber);
-    return;
-  }
-
-  if (await hasFastTestTiprowTriggered(pr.head.sha, token)) {
+  const summary = await getCheckStateSummary(pr.head.sha, token);
+  const skipReason = getOkToTestSkipReason({
+    failedChecks: summary.failed,
+    labels: pr.labels.map((label) => label.name),
+    now: new Date(),
+    tiprowTriggered: summary.tiprowTriggered,
+    hasMergeConflict: await isMergeConflictForOkToTestCandidate(pr, token),
+  });
+  if (skipReason) {
     await deleteOkToTestState(env, prNumber);
     return;
   }
@@ -434,7 +469,7 @@ async function reconcileOkToTestState(
       pr.number,
       pr.head.sha,
       'commented',
-      'Posted /ok-to-test and waiting for ok-to-test label propagation',
+      'Posted /ok-to-test after UTC+8 16:00 with lgtm + approved, failed CI, no tiprow, and no merge conflict',
       null,
       delayedIso(getOkToTestQueueIntervalMs(env))
     );
@@ -464,7 +499,7 @@ async function handlePullRequestWebhook(
   deliveryId: string
 ): Promise<void> {
   const action = payload.action;
-  if (!shouldHandlePullRequestWebhookAction(action)) {
+  if (!shouldHandlePullRequestWebhookAction(action, payload.label?.name)) {
     return;
   }
 
@@ -541,19 +576,11 @@ type CommitCheckRunsResponse = {
   check_runs: Array<{ name: string; status: string; conclusion: string | null }>;
 };
 
-type RepoFileResponse = {
-  content: string;
-  encoding: string;
-};
-
 type CheckStateSummary = {
   failed: string[];
   pending: string[];
+  tiprowTriggered: boolean;
 };
-
-function normalizeLogin(login: string): string {
-  return login.trim().replace(/^@/, '').toLowerCase();
-}
 
 function hasLabel(labels: PullLabel[], expected: string): boolean {
   const normalizedExpected = expected.toLowerCase();
@@ -578,7 +605,11 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
 
   const failed = new Set<string>();
   const pending = new Set<string>();
+  let tiprowTriggered = false;
   for (const status of statusData.statuses) {
+    if (includesFastTestTiprow(status.context)) {
+      tiprowTriggered = true;
+    }
     if (status.state === 'failure' || status.state === 'error') {
       failed.add(status.context);
     } else if (status.state === 'pending') {
@@ -587,6 +618,9 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
   }
 
   for (const checkRun of checkRunData.check_runs) {
+    if (includesFastTestTiprow(checkRun.name)) {
+      tiprowTriggered = true;
+    }
     if (checkRun.status !== 'completed') {
       pending.add(checkRun.name);
       continue;
@@ -604,66 +638,7 @@ async function getCheckStateSummary(sha: string, token: string): Promise<CheckSt
     }
   }
 
-  return { failed: Array.from(failed), pending: Array.from(pending) };
-}
-
-async function hasFastTestTiprowStatusContext(sha: string, token: string): Promise<boolean> {
-  const data = await githubRequest<CommitStatusResponse>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/status`,
-    token
-  );
-  return data.statuses.some((status) => includesFastTestTiprow(status.context));
-}
-
-async function hasFastTestTiprowCheckRun(sha: string, token: string): Promise<boolean> {
-  const data = await githubRequest<CommitCheckRunsResponse>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${sha}/check-runs?per_page=100`,
-    token
-  );
-  return data.check_runs.some((checkRun) => includesFastTestTiprow(checkRun.name));
-}
-
-async function hasFastTestTiprowTriggered(sha: string, token: string): Promise<boolean> {
-  if (await hasFastTestTiprowStatusContext(sha, token)) {
-    return true;
-  }
-  return await hasFastTestTiprowCheckRun(sha, token);
-}
-
-function decodeBase64Utf8(encoded: string): string {
-  const normalized = encoded.replace(/\s+/g, '');
-  const binary = atob(normalized);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-
-function parseOwnersAliasesUsers(content: string): Set<string> {
-  const users = new Set<string>();
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('- ')) continue;
-    const withoutComment = trimmed.slice(2).split('#')[0]?.trim() ?? '';
-    if (!withoutComment) continue;
-    const withoutQuotes = withoutComment.replace(/^['"]|['"]$/g, '');
-    const login = normalizeLogin(withoutQuotes);
-    if (login) {
-      users.add(login);
-    }
-  }
-  return users;
-}
-
-async function getOwnersAliasesUsers(token: string): Promise<Set<string>> {
-  const response = await githubRequest<RepoFileResponse>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/contents/OWNERS_ALIASES?ref=master`,
-    token
-  );
-  if (response.encoding !== 'base64') {
-    throw new Error(`Unexpected OWNERS_ALIASES encoding: ${response.encoding}`);
-  }
-  const content = decodeBase64Utf8(response.content);
-  return parseOwnersAliasesUsers(content);
+  return { failed: Array.from(failed), pending: Array.from(pending), tiprowTriggered };
 }
 
 function isMergeConflict(pr: PullItem): boolean {
@@ -1137,8 +1112,6 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
       return;
     }
 
-    const ownersAliasesUsers = await getOwnersAliasesUsers(token);
-
     console.log({
       level: 'info',
       event: 'ok_to_test.fallback_selected',
@@ -1157,7 +1130,6 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
           state.pr_number,
           state.last_seen_head_sha,
           token,
-          ownersAliasesUsers,
           runId,
           'cron'
         );
@@ -1181,16 +1153,11 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
     return;
   }
 
-  const lookbackMinutes = parseNumber(
-    env.OK_TO_TEST_LOOKBACK_MINUTES,
-    DEFAULT_OK_TO_TEST_LOOKBACK_MINUTES
-  );
-  const openMasterPrs = await listRecentOpenMasterPulls(token, lookbackMinutes);
+  const openMasterPrs = await listOpenMasterPullsWithRequiredLabels(token);
   if (openMasterPrs.length === 0) {
     return;
   }
 
-  const ownersAliasesUsers = await getOwnersAliasesUsers(token);
   for (const pr of openMasterPrs) {
     const queued = await enqueueOkToTestPending(
       env,
@@ -1208,7 +1175,6 @@ async function scanAndAutoOkToTest(env: Env, runId: string): Promise<void> {
         pr.number,
         pr.head.sha,
         token,
-        ownersAliasesUsers,
         runId,
         'cron'
       );
@@ -1372,8 +1338,8 @@ async function shouldScanRetest(env: Env): Promise<boolean> {
 }
 
 async function shouldScanOkToTest(env: Env): Promise<boolean> {
-  if (env.GITHUB_WEBHOOK_SECRET) {
-    return true;
+  if (!isWithinOkToTestWindowUtcPlus8(new Date())) {
+    return false;
   }
 
   const intervalMinutes = parseNumber(
