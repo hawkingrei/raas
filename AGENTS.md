@@ -1,5 +1,26 @@
 # AGENTS
 
+## 2026-03-27 Auto `/ok-to-test` for `lgtm + approved` PRs After 16:00
+
+Requirement:
+
+1. Stop using `OWNERS_ALIASES` as the gate for automatic `/ok-to-test`.
+2. Only consider open PRs targeting `master` that already have both:
+   - the `lgtm` label;
+   - the `approved` label.
+3. Only start cron scanning after UTC+8 `16:00`.
+4. Auto post `/ok-to-test` only when:
+   - `fast_test_tiprow` has not been triggered;
+   - the PR already has at least one failed CI check.
+   - the PR is not in merge-conflict state.
+5. Do not rely on the previous "recently created within 10 minutes" scan scope.
+
+## 2026-03-25 Retest Gate for `fast_test_tiprow` and `unit-test`
+
+Requirement:
+
+1. `fast_test_tiprow` and `idc-jenkins-ci-tidb/unit-test` should block automatic retest only when both fail in the same scan.
+2. If either one fails alone, automatic retest is still allowed, subject to the existing pending-check, blacklist, backoff, and rate-limit rules.
 ## 2026-03-11 Prioritize Retry for `lgtm + approved` PRs
 
 Requirement:
