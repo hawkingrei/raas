@@ -294,6 +294,9 @@ type OkToTestCandidate = Pick<
 type PullRequestWebhookPayload = {
   action?: string;
   number?: number;
+  label?: {
+    name?: string;
+  };
   repository?: {
     name?: string;
     owner?: { login?: string };
@@ -308,22 +311,30 @@ async function getPullByNumber(token: string, prNumber: number): Promise<PullDet
   );
 }
 
-async function listOpenMasterPulls(token: string, page: number): Promise<PullListItem[]> {
-  return await githubRequest<PullListItem[]>(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls?state=open&base=master&sort=updated&direction=desc&per_page=100&page=${page}`,
-    token
-  );
-}
+type SearchIssuesResponse = {
+  items: Array<{ number: number }>;
+};
 
 async function listOpenMasterPullsWithRequiredLabels(token: string): Promise<PullListItem[]> {
+  const query = `repo:${REPO_OWNER}/${REPO_NAME} is:pr is:open base:master label:lgtm label:approved`;
   const pulls: PullListItem[] = [];
+  const seen = new Set<number>();
 
   for (let page = 1; page <= 10; page += 1) {
-    const items = await listOpenMasterPulls(token, page);
+    const searchResult = await githubRequest<SearchIssuesResponse>(
+      `/search/issues?q=${encodeURIComponent(query)}&sort=updated&order=desc&per_page=100&page=${page}`,
+      token
+    );
+    const items = searchResult.items;
     if (items.length === 0) break;
 
-    for (const pr of items) {
-      if (hasRequiredOkToTestLabels(pr.labels.map((label) => label.name))) {
+    const prs = await Promise.all(items.map((item) => getPullByNumber(token, item.number)));
+    for (const pr of prs) {
+      if (
+        hasRequiredOkToTestLabels(pr.labels.map((label) => label.name)) &&
+        !seen.has(pr.number)
+      ) {
+        seen.add(pr.number);
         pulls.push(pr);
       }
     }
@@ -334,15 +345,24 @@ async function listOpenMasterPullsWithRequiredLabels(token: string): Promise<Pul
   return pulls;
 }
 
-function shouldHandlePullRequestWebhookAction(action: string | undefined): boolean {
-  return action === 'opened' || action === 'reopened' || action === 'synchronize' || action === 'labeled';
+function shouldHandlePullRequestWebhookAction(
+  action: string | undefined,
+  labelName: string | undefined
+): boolean {
+  if (action === 'labeled') {
+    if (!labelName) return false;
+    const normalizedLabel = labelName.toLowerCase();
+    return normalizedLabel === 'lgtm' || normalizedLabel === 'approved' || normalizedLabel === 'ok-to-test';
+  }
+
+  return action === 'opened' || action === 'reopened' || action === 'synchronize';
 }
 
 async function isMergeConflictForOkToTestCandidate(
   pr: OkToTestCandidate,
   token: string
 ): Promise<boolean> {
-  if (pr.mergeable_state) {
+  if (pr.mergeable_state === 'dirty' || pr.mergeable_state === 'clean') {
     return pr.mergeable_state === 'dirty';
   }
 
@@ -479,7 +499,7 @@ async function handlePullRequestWebhook(
   deliveryId: string
 ): Promise<void> {
   const action = payload.action;
-  if (!shouldHandlePullRequestWebhookAction(action)) {
+  if (!shouldHandlePullRequestWebhookAction(action, payload.label?.name)) {
     return;
   }
 
