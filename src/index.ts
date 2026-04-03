@@ -67,10 +67,10 @@ const DEFAULT_OK_TO_TEST_QUEUE_INTERVAL_MINUTES = 1;
 const DEFAULT_OK_TO_TEST_FALLBACK_BATCH_SIZE = 20;
 const DEFAULT_DAY_MAX_RETESTS = 2;
 const DEFAULT_NIGHT_MAX_RETESTS = 5;
-const BACKOFF_MINUTES = [0, 10, 20, 40, 360] as const;
+const BACKOFF_MINUTES = [0, 40, 80, 160, 360] as const;
 const MAX_RETEST_ATTEMPTS = 8;
 const HIGH_ATTEMPT_THRESHOLD = BACKOFF_MINUTES.length;
-const HIGH_ATTEMPT_INTERVAL_MS = 60 * 60 * 1000;
+export const HIGH_ATTEMPT_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING = 'last_high_attempt_executed_at';
 const UTC_PLUS_8_OFFSET_MS = 8 * 60 * 60 * 1000;
 const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
@@ -200,6 +200,14 @@ function hasReachedMaxAttempts(attemptCount: number): boolean {
   return attemptCount >= MAX_RETEST_ATTEMPTS;
 }
 
+export function getBackoffDelayMinutes(attemptCount: number): number | null {
+  if (attemptCount < 0 || attemptCount >= BACKOFF_MINUTES.length) {
+    return null;
+  }
+
+  return BACKOFF_MINUTES[attemptCount];
+}
+
 function getScheduledAttemptInfo(
   state: RetestStateRow,
   now: Date,
@@ -211,7 +219,7 @@ function getScheduledAttemptInfo(
 
   const attemptIndex = state.attempt_count + 1;
   if (!isHighAttemptIndex(attemptIndex)) {
-    const delayMinutes = immediate ? 0 : BACKOFF_MINUTES[state.attempt_count];
+    const delayMinutes = immediate ? 0 : getBackoffDelayMinutes(state.attempt_count) ?? 0;
     const scheduledAt = new Date(now.getTime() + delayMinutes * 60 * 1000).toISOString();
     const statusLog = immediate ? 'Scheduled immediate retest' : `Scheduled retest at ${scheduledAt}`;
     return { attemptIndex, scheduledAt, statusLog };
@@ -1267,7 +1275,7 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
           attempt,
           attempt.pr_number,
           nextAllowedAt,
-          `Deferred high-attempt retest until hourly slot opens at ${nextAllowedAt}`
+          `Deferred high-attempt retest until next rate-limit slot opens at ${nextAllowedAt}`
         );
         continue;
       }
