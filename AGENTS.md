@@ -1,5 +1,12 @@
 # AGENTS
 
+## 2026-04-07 Retest Gate for `fast_test_tiprow` and `tidb_parser_test`
+
+Requirement:
+
+1. `fast_test_tiprow` and `tidb_parser_test` should block automatic retest only when both fail in the same scan.
+2. This is an additional rule alongside the existing `unit-test` retest gate.
+
 ## 2026-03-27 Auto `/ok-to-test` for `lgtm + approved` PRs After 16:00
 
 Requirement:

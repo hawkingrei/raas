@@ -17,6 +17,20 @@ test('blocks retry when fast_test_tiprow and unit-test both fail', () => {
   });
 });
 
+test('blocks retry when fast_test_tiprow and tidb_parser_test both fail', () => {
+  const result = classifyChecks(
+    ['fast_test_tiprow', 'tidb_parser_test'],
+    [],
+    new Set()
+  );
+
+  assert.deepEqual(result, {
+    status: 'ignored',
+    shouldRetest: false,
+    log: 'Blocked checks: fast_test_tiprow + tidb_parser_test',
+  });
+});
+
 test('allows retry when fast_test_tiprow fails without unit-test', () => {
   const result = classifyChecks(['fast_test_tiprow'], [], new Set());
 

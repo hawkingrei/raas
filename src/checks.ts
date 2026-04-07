@@ -7,7 +7,10 @@ export type CheckDecision = {
 };
 
 export const BLOCKED_CHECK = 'fast_test_tiprow';
-export const COMPANION_BLOCKED_CHECK = 'idc-jenkins-ci-tidb/unit-test';
+export const COMPANION_BLOCKED_CHECKS = [
+  'idc-jenkins-ci-tidb/unit-test',
+  'tidb_parser_test',
+];
 
 export function isTideCheck(value: string): boolean {
   return value.trim().toLowerCase() === 'tide';
@@ -18,15 +21,17 @@ export function classifyChecks(
   pendingChecks: string[],
   blacklist: Set<string>
 ): CheckDecision {
-  if (
-    failedChecks.includes(BLOCKED_CHECK) &&
-    failedChecks.includes(COMPANION_BLOCKED_CHECK)
-  ) {
-    return {
-      status: 'ignored',
-      shouldRetest: false,
-      log: `Blocked checks: ${BLOCKED_CHECK} + ${COMPANION_BLOCKED_CHECK}`,
-    };
+  if (failedChecks.includes(BLOCKED_CHECK)) {
+    const failedCompanion = COMPANION_BLOCKED_CHECKS.find((name) =>
+      failedChecks.includes(name)
+    );
+    if (failedCompanion) {
+      return {
+        status: 'ignored',
+        shouldRetest: false,
+        log: `Blocked checks: ${BLOCKED_CHECK} + ${failedCompanion}`,
+      };
+    }
   }
   if (failedChecks.some((name) => blacklist.has(name))) {
     return { status: 'ignored', shouldRetest: false, log: 'Ignored by blacklist' };
