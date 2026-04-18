@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS retest_attempts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   pr_number INTEGER NOT NULL,
   attempt_index INTEGER NOT NULL,
+  count_attempt INTEGER NOT NULL DEFAULT 1,
   scheduled_at TEXT NOT NULL,
   executed_at TEXT NULL,
   status TEXT NOT NULL,

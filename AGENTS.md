@@ -1,5 +1,12 @@
 # AGENTS
 
+## 2026-04-18 Immediate No-Count Retest for Single `unit-test` or `fast_test_tiprow` Failure
+
+Requirement:
+
+1. When the only failed check in a scan is `idc-jenkins-ci-tidb/unit-test` or `fast_test_tiprow`, post `/retest` immediately.
+2. This immediate retest should not increase `attempt_count`.
+
 ## 2026-04-07 Retest Gate for `fast_test_tiprow` and `tidb_parser_test`
 
 Requirement:
