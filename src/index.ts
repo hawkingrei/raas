@@ -1366,7 +1366,6 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
       await rescheduleNoCountAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
       continue;
     }
-
     if (countAttempt && isHighAttemptIndex(attempt.attempt_index)) {
       if (!isInHighAttemptWindowUtcPlus8(nowDate)) {
         await rescheduleHighAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);

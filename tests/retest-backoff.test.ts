@@ -39,7 +39,6 @@ test('uses UTC+8 00:00-09:00 as the no-count retry window', () => {
   assert.equal(isInNoCountRetestWindowUtcPlus8(new Date('2026-04-18T00:59:59Z')), true);
   assert.equal(isInNoCountRetestWindowUtcPlus8(new Date('2026-04-18T01:00:00Z')), false);
 });
-
 test('keeps attempt index and attempt count unchanged for no-count retries', () => {
   assert.equal(getAttemptIndex(0, false), 0);
   assert.equal(getAttemptIndex(5, false), 5);
