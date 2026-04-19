@@ -1,5 +1,13 @@
 # AGENTS
 
+## 2026-04-19 Windowed No-Count Retest for Single `unit-test` or `fast_test_tiprow` Failure
+
+Requirement:
+
+1. For the no-count retest path introduced for a single `idc-jenkins-ci-tidb/unit-test` or `fast_test_tiprow` failure, retries remain unlimited because they do not increase `attempt_count`.
+2. That no-count retest path should only execute within the UTC+8 `00:00-09:00` window.
+3. Existing general high-attempt retry limits and gates remain unchanged.
+
 ## 2026-04-18 Immediate No-Count Retest for Single `unit-test` or `fast_test_tiprow` Failure
 
 Requirement:

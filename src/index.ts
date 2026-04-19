@@ -74,7 +74,8 @@ const HIGH_ATTEMPT_THRESHOLD = BACKOFF_MINUTES.length;
 export const HIGH_ATTEMPT_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING = 'last_high_attempt_executed_at';
 const UTC_PLUS_8_OFFSET_MS = 8 * 60 * 60 * 1000;
-const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
+export const HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8 = 8;
+export const NO_COUNT_RETEST_WINDOW_END_HOUR_UTC8 = 9;
 const OK_TO_TEST_INITIAL_DELAY_MS = 10 * 1000;
 const CRON_INTERVAL_MINUTES = 5;
 const RETEST_SCAN_CURSOR_SETTING = 'retest_scan_cursor';
@@ -156,10 +157,18 @@ function isNightInShanghai(now: Date): boolean {
   return utcPlus8Hour >= 18 || utcPlus8Hour < 9;
 }
 
-function isInHighAttemptWindowUtcPlus8(now: Date): boolean {
+function isInUtcPlus8Window(now: Date, endHourExclusive: number): boolean {
   const utcPlus8 = new Date(now.getTime() + UTC_PLUS_8_OFFSET_MS);
   const utcPlus8Hour = utcPlus8.getUTCHours();
-  return utcPlus8Hour < HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8;
+  return utcPlus8Hour < endHourExclusive;
+}
+
+export function isInHighAttemptWindowUtcPlus8(now: Date): boolean {
+  return isInUtcPlus8Window(now, HIGH_ATTEMPT_WINDOW_END_HOUR_UTC8);
+}
+
+export function isInNoCountRetestWindowUtcPlus8(now: Date): boolean {
+  return isInUtcPlus8Window(now, NO_COUNT_RETEST_WINDOW_END_HOUR_UTC8);
 }
 
 function getNextHighAttemptWindowStartUtcPlus8Iso(now: Date): string {
@@ -232,11 +241,20 @@ function getScheduledAttemptInfo(
 
   const attemptIndex = getAttemptIndex(state.attempt_count, countAttempt);
   if (!countAttempt) {
-    const scheduledAt = now.toISOString();
+    if (isInNoCountRetestWindowUtcPlus8(now)) {
+      const scheduledAt = now.toISOString();
+      return {
+        attemptIndex,
+        scheduledAt,
+        statusLog: 'Scheduled no-count retest in UTC+8 00:00-09:00 window',
+      };
+    }
+
+    const scheduledAt = getNextHighAttemptWindowStartUtcPlus8Iso(now);
     return {
       attemptIndex,
       scheduledAt,
-      statusLog: 'Scheduled immediate retest without increasing attempt count',
+      statusLog: `Deferred no-count retest until next UTC+8 00:00 window at ${scheduledAt}`,
     };
   }
 
@@ -1058,6 +1076,21 @@ async function rescheduleHighAttemptToNextUtcPlus8Midnight(
   );
 }
 
+async function rescheduleNoCountAttemptToNextUtcPlus8Midnight(
+  env: Env,
+  attempt: RetestAttemptRow,
+  prNumber: number
+): Promise<void> {
+  const scheduledAt = getNextHighAttemptWindowStartUtcPlus8Iso(new Date());
+  await rescheduleHighAttempt(
+    env,
+    attempt,
+    prNumber,
+    scheduledAt,
+    `Deferred no-count retest until next UTC+8 00:00 window at ${scheduledAt}`
+  );
+}
+
 async function rescheduleHighAttempt(
   env: Env,
   attempt: RetestAttemptRow,
@@ -1150,7 +1183,6 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
       }
       if (!checkResult.shouldRetest) continue;
       if (state.disabled_at && checkResult.retestMode !== 'immediate_no_count') continue;
-
       const pending = await getPendingAttempt(env, pr.number);
       if (pending) continue;
 
@@ -1330,6 +1362,10 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
     if (!state) continue;
 
     const countAttempt = attempt.count_attempt !== 0;
+    if (!countAttempt && !isInNoCountRetestWindowUtcPlus8(nowDate)) {
+      await rescheduleNoCountAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
+      continue;
+    }
     if (countAttempt && isHighAttemptIndex(attempt.attempt_index)) {
       if (!isInHighAttemptWindowUtcPlus8(nowDate)) {
         await rescheduleHighAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
