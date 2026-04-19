@@ -1,5 +1,5 @@
 import { Hono } from 'hono';
-import { BLOCKED_CHECK, classifyChecks, isTideCheck, type CheckDecision, type CheckStatus } from './checks';
+import { BLOCKED_CHECK, classifyChecks, type CheckDecision, type CheckStatus } from './checks';
 import {
   getOkToTestSkipReason,
   hasRequiredOkToTestLabels,
@@ -30,6 +30,7 @@ type RetestAttemptRow = {
   id: number;
   pr_number: number;
   attempt_index: number;
+  count_attempt: number;
   scheduled_at: string;
 };
 
@@ -80,7 +81,10 @@ const RETEST_SCAN_CURSOR_SETTING = 'retest_scan_cursor';
 const REPO_OWNER = 'pingcap';
 const REPO_NAME = 'tidb';
 const RETEST_REQUESTED_LOG = 'Retest comment posted; waiting for CI status update';
+const RETEST_REQUESTED_NO_COUNT_LOG =
+  'Retest comment posted without increasing attempt count; waiting for CI status update';
 let retestStateColumnsEnsured = false;
+let retestAttemptColumnsEnsured = false;
 let okToTestStateTableEnsured = false;
 
 function nowIso(): string {
@@ -200,6 +204,14 @@ function hasReachedMaxAttempts(attemptCount: number): boolean {
   return attemptCount >= MAX_RETEST_ATTEMPTS;
 }
 
+export function getAttemptIndex(attemptCount: number, countAttempt: boolean): number {
+  return attemptCount + (countAttempt ? 1 : 0);
+}
+
+export function getNextAttemptCount(attemptCount: number, countAttempt: boolean): number {
+  return attemptCount + (countAttempt ? 1 : 0);
+}
+
 export function getBackoffDelayMinutes(attemptCount: number): number | null {
   if (attemptCount < 0 || attemptCount >= BACKOFF_MINUTES.length) {
     return null;
@@ -211,13 +223,23 @@ export function getBackoffDelayMinutes(attemptCount: number): number | null {
 function getScheduledAttemptInfo(
   state: RetestStateRow,
   now: Date,
-  immediate: boolean
+  immediate: boolean,
+  countAttempt: boolean
 ): { attemptIndex: number; scheduledAt: string; statusLog: string } | null {
-  if (hasReachedMaxAttempts(state.attempt_count)) {
+  if (countAttempt && hasReachedMaxAttempts(state.attempt_count)) {
     return null;
   }
 
-  const attemptIndex = state.attempt_count + 1;
+  const attemptIndex = getAttemptIndex(state.attempt_count, countAttempt);
+  if (!countAttempt) {
+    const scheduledAt = now.toISOString();
+    return {
+      attemptIndex,
+      scheduledAt,
+      statusLog: 'Scheduled immediate retest without increasing attempt count',
+    };
+  }
+
   if (!isHighAttemptIndex(attemptIndex)) {
     const delayMinutes = immediate ? 0 : getBackoffDelayMinutes(state.attempt_count) ?? 0;
     const scheduledAt = new Date(now.getTime() + delayMinutes * 60 * 1000).toISOString();
@@ -718,6 +740,23 @@ async function ensureRetestStateColumns(env: Env): Promise<void> {
   retestStateColumnsEnsured = true;
 }
 
+async function ensureRetestAttemptColumns(env: Env): Promise<void> {
+  if (retestAttemptColumnsEnsured) return;
+
+  try {
+    await env.DB.prepare(
+      'ALTER TABLE retest_attempts ADD COLUMN count_attempt INTEGER NOT NULL DEFAULT 1'
+    ).run();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes('duplicate column name: count_attempt')) {
+      throw error;
+    }
+  }
+
+  retestAttemptColumnsEnsured = true;
+}
+
 async function ensureOkToTestStateTable(env: Env): Promise<void> {
   if (okToTestStateTableEnsured) return;
 
@@ -927,8 +966,9 @@ async function upsertStateAndResetIfHeadChanged(
 }
 
 async function getPendingAttempt(env: Env, prNumber: number): Promise<RetestAttemptRow | null> {
+  await ensureRetestAttemptColumns(env);
   const row = await env.DB.prepare(
-    `SELECT id, pr_number, attempt_index, scheduled_at
+    `SELECT id, pr_number, attempt_index, count_attempt, scheduled_at
      FROM retest_attempts
      WHERE pr_number = ? AND executed_at IS NULL
      ORDER BY scheduled_at ASC
@@ -950,18 +990,27 @@ async function markRetestStateDisabled(env: Env, prNumber: number): Promise<void
 async function enqueueRetestAttempt(
   env: Env,
   state: RetestStateRow,
-  immediate: boolean
+  immediate: boolean,
+  countAttempt: boolean
 ): Promise<void> {
-  const schedule = getScheduledAttemptInfo(state, new Date(), immediate);
+  await ensureRetestAttemptColumns(env);
+  const schedule = getScheduledAttemptInfo(state, new Date(), immediate, countAttempt);
   if (!schedule) {
     await markRetestStateDisabled(env, state.pr_number);
     return;
   }
 
   await env.DB.prepare(
-    'INSERT INTO retest_attempts (pr_number, attempt_index, scheduled_at, status) VALUES (?, ?, ?, ?)'
+    `INSERT INTO retest_attempts (pr_number, attempt_index, count_attempt, scheduled_at, status)
+     VALUES (?, ?, ?, ?, ?)`
   )
-    .bind(state.pr_number, schedule.attemptIndex, schedule.scheduledAt, 'scheduled')
+    .bind(
+      state.pr_number,
+      schedule.attemptIndex,
+      countAttempt ? 1 : 0,
+      schedule.scheduledAt,
+      'scheduled'
+    )
     .run();
 
   await env.DB.prepare('UPDATE retest_state SET next_retest_at = ?, last_status_log = ? WHERE pr_number = ?')
@@ -975,7 +1024,7 @@ async function scheduleNextAttempt(env: Env, state: RetestStateRow): Promise<voi
     return;
   }
 
-  await enqueueRetestAttempt(env, state, false);
+  await enqueueRetestAttempt(env, state, false, true);
 }
 
 async function scheduleImmediateAttempt(env: Env, state: RetestStateRow): Promise<void> {
@@ -984,7 +1033,14 @@ async function scheduleImmediateAttempt(env: Env, state: RetestStateRow): Promis
     return;
   }
 
-  await enqueueRetestAttempt(env, state, true);
+  await enqueueRetestAttempt(env, state, true, true);
+}
+
+async function scheduleImmediateAttemptWithoutCounting(
+  env: Env,
+  state: RetestStateRow
+): Promise<void> {
+  await enqueueRetestAttempt(env, state, true, false);
 }
 
 async function rescheduleHighAttemptToNextUtcPlus8Midnight(
@@ -1072,10 +1128,15 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
       const updatedMs = Date.parse(pr.updated_at);
       if (!Number.isFinite(updatedMs) || updatedMs < cutoffMs) continue;
 
-      let checkResult: { status: CheckStatus; shouldRetest: boolean; log: string };
+      let checkResult: CheckDecision;
       let failedChecks: string[] = [];
       if (isMergeConflict(pr)) {
-        checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+        checkResult = {
+          status: 'conflict',
+          shouldRetest: false,
+          log: 'Merge conflict',
+          retestMode: null,
+        };
       } else {
         const summary = await getCheckStateSummary(pr.head.sha, token);
         failedChecks = summary.failed;
@@ -1088,10 +1149,15 @@ async function scanAndSchedule(env: Env, runId: string): Promise<void> {
         continue;
       }
       if (!checkResult.shouldRetest) continue;
-      if (state.disabled_at) continue;
+      if (state.disabled_at && checkResult.retestMode !== 'immediate_no_count') continue;
 
       const pending = await getPendingAttempt(env, pr.number);
       if (pending) continue;
+
+      if (checkResult.retestMode === 'immediate_no_count') {
+        await scheduleImmediateAttemptWithoutCounting(env, state);
+        continue;
+      }
 
       await scheduleNextAttempt(env, state);
     } catch (error) {
@@ -1211,8 +1277,9 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
   const now = nowDate.toISOString();
   let lastHighAttemptExecutedAt = await getSetting(env, LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING);
 
+  await ensureRetestAttemptColumns(env);
   const rows = await env.DB.prepare(
-    `SELECT id, pr_number, attempt_index, scheduled_at
+    `SELECT id, pr_number, attempt_index, count_attempt, scheduled_at
      FROM retest_attempts
      WHERE executed_at IS NULL AND scheduled_at <= ?
      ORDER BY scheduled_at ASC`
@@ -1262,7 +1329,8 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
     const state = await getRetestState(env, attempt.pr_number);
     if (!state) continue;
 
-    if (isHighAttemptIndex(attempt.attempt_index)) {
+    const countAttempt = attempt.count_attempt !== 0;
+    if (countAttempt && isHighAttemptIndex(attempt.attempt_index)) {
       if (!isInHighAttemptWindowUtcPlus8(nowDate)) {
         await rescheduleHighAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
         continue;
@@ -1302,9 +1370,14 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
       .bind(now, status, errorMessage, attempt.id)
       .run();
 
-    const nextAttemptCount = state.attempt_count + 1;
-    const disable = nextAttemptCount >= MAX_RETEST_ATTEMPTS;
-    const statusLog = status === 'success' ? RETEST_REQUESTED_LOG : `Retest failed: ${errorMessage ?? 'unknown'}`;
+    const nextAttemptCount = getNextAttemptCount(state.attempt_count, countAttempt);
+    const disable = countAttempt && nextAttemptCount >= MAX_RETEST_ATTEMPTS;
+    const statusLog =
+      status === 'success'
+        ? countAttempt
+          ? RETEST_REQUESTED_LOG
+          : RETEST_REQUESTED_NO_COUNT_LOG
+        : `Retest failed: ${errorMessage ?? 'unknown'}`;
     const nextCheckStatus = status === 'success' ? 'running' : state.last_check_status;
     const nextCheckAt = status === 'success' ? now : state.last_check_at;
     await env.DB.prepare(
@@ -1313,7 +1386,7 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
       .bind(
         nextAttemptCount,
         now,
-        disable ? now : null,
+        disable ? now : countAttempt ? null : state.disabled_at,
         errorMessage,
         statusLog,
         nextCheckStatus,
@@ -1322,7 +1395,7 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
       )
       .run();
 
-    if (isHighAttemptIndex(attempt.attempt_index)) {
+    if (countAttempt && isHighAttemptIndex(attempt.attempt_index)) {
       await setSetting(env, LAST_HIGH_ATTEMPT_EXECUTED_AT_SETTING, now);
       lastHighAttemptExecutedAt = now;
     }
@@ -1505,7 +1578,12 @@ app.post('/track/:num', async (c) => {
     let checkResult: CheckDecision;
     let failedChecks: string[] = [];
     if (isMergeConflict(pr)) {
-      checkResult = { status: 'conflict', shouldRetest: false, log: 'Merge conflict' };
+      checkResult = {
+        status: 'conflict',
+        shouldRetest: false,
+        log: 'Merge conflict',
+        retestMode: null,
+      };
     } else {
       const summary = await getCheckStateSummary(pr.head.sha, c.env.GITHUB_TOKEN);
       failedChecks = summary.failed;
@@ -1520,10 +1598,14 @@ app.post('/track/:num', async (c) => {
     }
 
     if (checkResult.shouldRetest) {
-      if (state && !state.disabled_at) {
+      if (state && (!state.disabled_at || checkResult.retestMode === 'immediate_no_count')) {
         const pending = await getPendingAttempt(c.env, num);
         if (!pending) {
-          await scheduleImmediateAttempt(c.env, state);
+          if (checkResult.retestMode === 'immediate_no_count') {
+            await scheduleImmediateAttemptWithoutCounting(c.env, state);
+          } else {
+            await scheduleImmediateAttempt(c.env, state);
+          }
           await executeDueAttempts(c.env, `manual-track-${num}-${crypto.randomUUID()}`);
         }
       }
