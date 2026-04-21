@@ -171,6 +171,10 @@ export function isInNoCountRetestWindowUtcPlus8(now: Date): boolean {
   return isInUtcPlus8Window(now, NO_COUNT_RETEST_WINDOW_END_HOUR_UTC8);
 }
 
+export function shouldGateNoCountRetestByWindow(attemptCount: number): boolean {
+  return hasReachedMaxAttempts(attemptCount);
+}
+
 function getNextHighAttemptWindowStartUtcPlus8Iso(now: Date): string {
   const utcPlus8 = new Date(now.getTime() + UTC_PLUS_8_OFFSET_MS);
   const nextUtcPlus8WindowStartMs = Date.UTC(
@@ -241,12 +245,17 @@ function getScheduledAttemptInfo(
 
   const attemptIndex = getAttemptIndex(state.attempt_count, countAttempt);
   if (!countAttempt) {
-    if (isInNoCountRetestWindowUtcPlus8(now)) {
+    if (
+      !shouldGateNoCountRetestByWindow(state.attempt_count) ||
+      isInNoCountRetestWindowUtcPlus8(now)
+    ) {
       const scheduledAt = now.toISOString();
       return {
         attemptIndex,
         scheduledAt,
-        statusLog: 'Scheduled no-count retest in UTC+8 00:00-09:00 window',
+        statusLog: shouldGateNoCountRetestByWindow(state.attempt_count)
+          ? 'Scheduled no-count retest in UTC+8 00:00-09:00 window'
+          : 'Scheduled no-count retest without window gating',
       };
     }
 
@@ -1362,7 +1371,11 @@ async function executeDueAttempts(env: Env, runId: string): Promise<void> {
     if (!state) continue;
 
     const countAttempt = attempt.count_attempt !== 0;
-    if (!countAttempt && !isInNoCountRetestWindowUtcPlus8(nowDate)) {
+    if (
+      !countAttempt &&
+      shouldGateNoCountRetestByWindow(state.attempt_count) &&
+      !isInNoCountRetestWindowUtcPlus8(nowDate)
+    ) {
       await rescheduleNoCountAttemptToNextUtcPlus8Midnight(env, attempt, attempt.pr_number);
       continue;
     }
