@@ -10,6 +10,7 @@ import {
   isInHighAttemptWindowUtcPlus8,
   isInNoCountRetestWindowUtcPlus8,
   NO_COUNT_RETEST_WINDOW_END_HOUR_UTC8,
+  shouldGateNoCountRetestByWindow,
 } from '../src/index';
 
 test('uses the updated retest backoff cadence before high-attempt mode', () => {
@@ -38,6 +39,13 @@ test('uses UTC+8 00:00-09:00 as the no-count retry window', () => {
   assert.equal(NO_COUNT_RETEST_WINDOW_END_HOUR_UTC8, 9);
   assert.equal(isInNoCountRetestWindowUtcPlus8(new Date('2026-04-18T00:59:59Z')), true);
   assert.equal(isInNoCountRetestWindowUtcPlus8(new Date('2026-04-18T01:00:00Z')), false);
+});
+
+test('only gates no-count retries by window after reaching max attempts', () => {
+  assert.equal(shouldGateNoCountRetestByWindow(0), false);
+  assert.equal(shouldGateNoCountRetestByWindow(7), false);
+  assert.equal(shouldGateNoCountRetestByWindow(8), true);
+  assert.equal(shouldGateNoCountRetestByWindow(9), true);
 });
 test('keeps attempt index and attempt count unchanged for no-count retries', () => {
   assert.equal(getAttemptIndex(0, false), 0);

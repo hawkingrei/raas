@@ -1,5 +1,13 @@
 # AGENTS
 
+## 2026-04-21 No-Count Retry Window Applies Only After Max Attempts
+
+Requirement:
+
+1. For the unlimited no-count retry path, ignore the UTC+8 `00:00-09:00` window while `attempt_count` has not reached the general max retry limit.
+2. Only after `attempt_count` reaches the general max retry limit should the no-count retry path be gated by the UTC+8 `00:00-09:00` window.
+3. Existing normal retry and high-attempt retry rules remain unchanged.
+
 ## 2026-04-19 Windowed No-Count Retest for Single `unit-test` or `fast_test_tiprow` Failure
 
 Requirement:
